@@ -1,0 +1,19 @@
+{
+  "editor.formatOnSave": true,
+  "editor.formatOnPaste": true,
+  "files.trimTrailingWhitespace": true,
+  "files.autoSave": "onFocusChange",
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": [".", "-s"],
+  // https://code.visualstudio.com/docs/setup/linux#_visual-studio-code-is-unable-to-watch-for-file-changes-in-this-large-workspace-error-enospc
+  "files.watcherExclude": {
+    "**/.venv/**": true,
+    "**/.mypy_cache/**": true,
+    "**/.pytest_cache/**": true,
+    "**/.ruff_cache/**": true,
+    "**/.git/objects/**": true,
+    "**/.git/subtree-cache/**": true,
+    "**/node_modules/*/**": true
+  }
+}

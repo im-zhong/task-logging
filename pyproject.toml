@@ -1,7 +1,57 @@
 [project]
 name = "task-logging"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.0.1"
+description = ""
+authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+requires-python = ">=3.12,<4.0"
+dependencies = ["pydantic>=2.10.6,<3.0.0"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.1.0,<5.0.0",
+    "ruff>=0.9.9,<1.0.0",
+    "mypy>=1.15.0,<2.0.0",
+    "pytest>=8.3.5,<9.0.0",
+    "pytest-cov>=6.0.0,<7.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[tool.ruff]
+fix = true
+
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",
+    "ERA",
+    "PGH",
+    "RUF003",
+    "E501",
+    "COM",
+    "FA102",
+    "T20",
+    "TD",
+    "FIX",
+    "BLE",
+    "S",
+    "G",
+    "TC",
+    "RUF001", # https://docs.astral.sh/ruff/rules/ambiguous-unicode-character-string/
+    "ANN001", # https://docs.astral.sh/ruff/rules/#flake8-annotations-ann
+    "ANN002", # https://docs.astral.sh/ruff/rules/#flake8-annotations-ann
+    "ANN003", # https://docs.astral.sh/ruff/rules/#flake8-annotations-ann
+    "RUF002",
+    "ANN401", # https://docs.astral.sh/ruff/rules/any-type/
+]
+
+[tool.mypy]
+strict = true
+
+
+# https://docs.astral.sh/uv/guides/package/
