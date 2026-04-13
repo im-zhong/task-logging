@@ -1,6 +1,6 @@
 [project]
 name = "task-logging"
-version = "0.0.1"
+version = "0.0.2"
 description = ""
 authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
