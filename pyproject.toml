@@ -7,6 +7,19 @@ readme = "README.md"
 requires-python = ">=3.12,<4.0"
 dependencies = ["pydantic>=2.10.6,<3.0.0"]
 
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+keywords = ["task", "logging"]
+
+[project.urls]
+Homepage = "https://github.com/im-zhong/task-logging"
+Repository = "https://github.com/im-zhong/task-logging"
+Issues = "https://github.com/im-zhong/task-logging/issues"
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.1.0,<5.0.0",
