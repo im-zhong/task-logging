@@ -5,7 +5,9 @@ description = ""
 authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
 requires-python = ">=3.12,<4.0"
-dependencies = ["pydantic>=2.10.6,<3.0.0"]
+dependencies = [
+    "pydantic>=2.10.6,<3.0.0",
+]
 
 classifiers = [
     "Programming Language :: Python :: 3",
