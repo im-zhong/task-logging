@@ -111,6 +111,10 @@ class JsonFormatter(logging.Formatter):
           "exc":         {name, details, stack_trace, locals_dict} or null
           ...:           any extra fields you bound via task_context(**extra)
         }
+
+    For the rationale behind each key name, what was renamed from stdlib
+    LogRecord, what was dropped, and the stability promise, see
+    docs/design/json-schema.md.
     """
 
     def __init__(self, *, capture_locals: bool = True) -> None:

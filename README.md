@@ -448,6 +448,7 @@ If you want a deeper mental model than this README provides, see [docs/](docs/):
 - [`docs/design/task-context.md`](docs/design/task-context.md) — how `task_context` makes `task_id` flow through threads, asyncio tasks, and third-party libraries' logs
 - [`docs/design/stdlib-logging-primer.md`](docs/design/stdlib-logging-primer.md) — bottom-up tour of stdlib `logging` (LogRecord, the logger tree, handlers, filters, formatters) with the rules that prevent the most common pitfalls
 - [`docs/design/why-json-logs.md`](docs/design/why-json-logs.md) — Loki accepts arbitrary text; why does this library emit JSON anyway? What do we gain, and what do we trade away?
+- [`docs/design/json-schema.md`](docs/design/json-schema.md) — where the JSON keys (`ts`, `level`, `service`, `task_id`, …) come from, what was renamed, what was dropped, and the stability promise
 
 ---
 
