@@ -175,3 +175,7 @@ cython_debug/
 
 # dev conf
 dev.toml
+
+
+# omc
+.omc/
