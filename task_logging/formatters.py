@@ -2,6 +2,26 @@
 
 Each `LogRecord` is rendered as a single-line JSON object with a stable schema
 so Alloy's `stage.json` can extract fields reliably.
+
+Why JSON (not plain text, not logfmt):
+    Loki accepts arbitrary text — JSON is not required. We choose it because
+    it gives us:
+      - typed, named fields in LogQL (`| json | task_id="..."` instead of
+        substring grep)
+      - clean Alloy promotion: low-cardinality fields (level) become Loki
+        labels; high-cardinality fields (task_id) become structured metadata,
+        so Loki indexes the cheap stuff and stays queryable on the rest
+      - schema growth without breaking parsers — adding a key never breaks
+        consumers, unlike a regex over a fixed column order
+      - native nesting for stack traces / locals snapshots
+      - one durable contract every downstream tool agrees on (Alloy, jq,
+        future Splunk sidecars, ...). Plain text means every consumer ships
+        its own regex and they silently disagree at the edges.
+    Cost: humans can't read raw JSON easily, so the console handler in
+    setup_logging defaults to a human formatter; only the *file* (which Alloy
+    reads, not you) is JSON.
+
+See docs/design/why-json-logs.md for the full discussion.
 """
 
 from __future__ import annotations
@@ -98,7 +118,14 @@ class JsonFormatter(logging.Formatter):
         self._capture_locals = capture_locals
 
     def format(self, record: logging.LogRecord) -> str:
+        # Top-level keys are kept STABLE — Alloy's stage.json config in the
+        # README references them by name. Renaming a key here is a breaking
+        # change for every Alloy config in the wild. Add new keys freely;
+        # don't rename or remove existing ones without a major bump.
         payload: dict[str, Any] = {
+            # ts is the application's timestamp, used by Alloy as the canonical
+            # timestamp via stage.timestamp — far more accurate than "the time
+            # Alloy happened to read the line."
             "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
@@ -160,11 +187,18 @@ class JsonFormatter(logging.Formatter):
         }
 
         if self._capture_locals and exc_tb is not None:
+            # Walk to the DEEPEST frame — the one where the exception was
+            # actually raised — not the outermost handler. The deepest frame's
+            # locals are what you'd see in a debugger sitting on the raise
+            # statement, which is the post-mortem view that's actually useful.
             deepest: TracebackType = exc_tb
             while deepest.tb_next is not None:
                 deepest = deepest.tb_next
             frame_locals = deepest.tb_frame.f_locals or {}
-            # repr() everything — values may not be JSON-serialisable.
+            # repr() everything: arbitrary user values are rarely JSON-serialisable
+            # (sockets, file handles, ORM objects, ...). repr is best-effort and
+            # never raises for sane __repr__ implementations; _json_default
+            # below is the last-resort fallback for anything pathological.
             rendered["locals_dict"] = {k: repr(v) for k, v in frame_locals.items()}
 
         return rendered

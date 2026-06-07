@@ -150,9 +150,7 @@ def test_exception_is_captured_with_locals(log_file: Path) -> None:
 
 
 def test_capture_locals_can_be_disabled(log_file: Path) -> None:
-    setup_logging(
-        service="svc", log_file=log_file, console=False, capture_locals=False
-    )
+    setup_logging(service="svc", log_file=log_file, console=False, capture_locals=False)
     log = logging.getLogger("biz")
     try:
         raise RuntimeError("boom")

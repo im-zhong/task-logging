@@ -4,6 +4,18 @@ Works on plain functions and on instance / class / static methods alike. The
 logger is supplied explicitly at decoration time (or auto-resolved from the
 wrapped function's module), so the decorator imposes no requirements on the
 class it decorates.
+
+Why one decorator (not separate FunctionLogger / ClassFunctionLogger):
+    The earlier two-class split existed because TaskLogger bound
+    (service, task_id) to the logger instance, so methods needed a
+    per-instance logger via self._logger. The contextvars-based rewrite moved
+    task_id off the logger entirely (it now flows through ContextVar), so
+    that whole motivation disappeared. Forcing classes to expose self._logger
+    became pure coupling — boilerplate, attribute-name collisions, and a
+    silent no-op when the attribute is missing — solving a problem that no
+    longer exists.
+
+See docs/design/decorators.md for the full reasoning.
 """
 
 from __future__ import annotations
@@ -65,13 +77,19 @@ def log_call(
     """
 
     def decorator(func: Callable[P, R]) -> Callable[P, R]:
-        # Resolve the logger once at decoration time. Falling back to the
-        # function's own module mirrors the stdlib "logging.getLogger(__name__)"
-        # convention.
+        # Resolve the logger ONCE at decoration time, not on every call.
+        # Falling back to func.__module__ mirrors the stdlib idiom
+        # `logging.getLogger(__name__)` — same logger you'd get if you
+        # had written `log = logging.getLogger(__name__)` at the top of
+        # the module the function lives in.
         bound_logger = logger or logging.getLogger(func.__module__)
 
         @functools.wraps(func)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            # __qualname__ (not __name__) so methods show up as
+            # "Service.handle" instead of just "handle". This is the one
+            # piece of class-context the old ClassFunctionLogger gave us
+            # implicitly; we keep it without requiring class setup.
             bound_logger.log(
                 level,
                 "ENTER %s args=%r kwargs=%r",
@@ -79,18 +97,31 @@ def log_call(
                 args,
                 kwargs,
             )
+            # perf_counter is monotonic — immune to NTP adjustments and
+            # daylight-saving jumps that would corrupt elapsed-time math
+            # if we used time.time().
             start = time.perf_counter()
             try:
                 result = func(*args, **kwargs)
             except Exception:
                 elapsed_ms = (time.perf_counter() - start) * 1000
+                # RAISE always uses logger.exception (== ERROR level + exc_info)
+                # regardless of the user's chosen `level`. An unhandled
+                # exception escaping a function is by definition exceptional;
+                # filing it at DEBUG just because entry/exit logs are at DEBUG
+                # would be wrong.
                 bound_logger.exception(
                     "RAISE %s after %.3fms", func.__qualname__, elapsed_ms
                 )
+                # Re-raise: the decorator is a passive observer, not a
+                # swallower. Callers must still see the exception.
                 raise
             elapsed_ms = (time.perf_counter() - start) * 1000
             bound_logger.log(
                 level,
+                # %r (repr) for args/kwargs/return values: round-trips for
+                # primitives, distinguishes '' from None, and surfaces useful
+                # detail for objects with a sane __repr__.
                 "EXIT %s return=%r cost_ms=%.3f",
                 func.__qualname__,
                 result,

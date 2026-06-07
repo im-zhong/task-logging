@@ -440,6 +440,17 @@ After this runs, every line in `/var/log/billing/app.log` is JSON tagged with th
 
 ---
 
+## Design notes
+
+If you want a deeper mental model than this README provides, see [docs/](docs/):
+
+- [`docs/design/decorators.md`](docs/design/decorators.md) — why one `@log_call` instead of `FunctionLogger` + `ClassFunctionLogger`, and why classes don't need a `_logger` attribute
+- [`docs/design/task-context.md`](docs/design/task-context.md) — how `task_context` makes `task_id` flow through threads, asyncio tasks, and third-party libraries' logs
+- [`docs/design/stdlib-logging-primer.md`](docs/design/stdlib-logging-primer.md) — bottom-up tour of stdlib `logging` (LogRecord, the logger tree, handlers, filters, formatters) with the rules that prevent the most common pitfalls
+- [`docs/design/why-json-logs.md`](docs/design/why-json-logs.md) — Loki accepts arbitrary text; why does this library emit JSON anyway? What do we gain, and what do we trade away?
+
+---
+
 ## Development
 
 ```bash

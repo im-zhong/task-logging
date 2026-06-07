@@ -1,4 +1,21 @@
-"""Logging filters that enrich `LogRecord` with task context and service info."""
+"""Logging filters that enrich `LogRecord` with task context and service info.
+
+Why a Filter (not a custom Logger subclass, not setLogRecordFactory):
+    A logging.Filter on a *handler* runs for EVERY record that reaches the
+    handler, no matter which logger emitted it. That's exactly what we want:
+    install one filter on the root handler and every record in the process —
+    yours, requests, urllib3, boto3 — gets enriched.
+
+    A filter on a *logger* would only see records emitted directly on that
+    logger; child-logger records that propagate up are NOT subject to it.
+    That asymmetry is documented in stdlib but trips most people up.
+
+    setLogRecordFactory works too but is a process-global mutation that's
+    hard to reverse and tests can't isolate cleanly. A handler-level filter
+    is local and reversible (setup_logging() can replace its own handlers).
+
+See docs/design/stdlib-logging-primer.md (§4) for the full reasoning.
+"""
 
 from __future__ import annotations
 
@@ -36,22 +53,33 @@ class TaskContextFilter(logging.Filter):
         self._extra: dict[str, Any] = dict(extra) if extra else {}
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Static fields known at setup time — service identity and process
+        # identity. Stamping them here (rather than in the formatter) keeps
+        # the formatter purely transport-layer and makes record introspection
+        # in tests / other handlers see the enriched record too.
         record.service = self._service
         record.env = self._env
         record.hostname = _HOSTNAME
         record.pid = _PID
 
-        # Pull whatever the active task_context() bound.
+        # Pull whatever the active task_context() bound. ContextVar lookup is
+        # cheap (a dict get on a per-thread/task variable); doing it on every
+        # record is fine.
         ctx = get_task_context()
         record.task_id = ctx.get("task_id")
 
         # Merge static extras (lowest priority) and dynamic context fields
-        # (highest priority). Don't overwrite reserved LogRecord attributes.
+        # (highest priority). Skip reserved LogRecord attributes so a
+        # well-meaning user can't accidentally clobber `record.msg` or
+        # `record.levelname` by binding e.g. task_context(msg="...").
         for key, value in {**self._extra, **ctx}.items():
             if key in _RESERVED_LOGRECORD_ATTRS:
                 continue
             setattr(record, key, value)
 
+        # Filters can return False to drop a record. We never drop — this
+        # filter is purely an enricher, and dropping logs based on context
+        # state would be a surprising behaviour for callers to debug.
         return True
 
 
