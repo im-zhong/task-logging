@@ -182,63 +182,57 @@ Same goes for raising inside a decorated function — see below.
 
 ---
 
-## Function decorators
+## The `@log_call` decorator
 
-Two decorators are provided for zero-boilerplate enter / exit / timing logs.
-
-### `FunctionLogger` — for module-level functions
+For zero-boilerplate enter / exit / timing logs, wrap any callable with `log_call`. It works on plain functions, instance methods, classmethods, staticmethods — anything — and imposes **no requirements on the surrounding class**.
 
 ```python
 import logging
-from task_logging import FunctionLogger
+from task_logging import log_call
 
 log = logging.getLogger(__name__)
-func_log = FunctionLogger(logger=log)
 
-@func_log.log_func()  # default level=logging.INFO
+@log_call(log)
 def add(x: int, y: int) -> int:
     return x + y
 
 add(2, 3)
-# Logs (in JSON):
+# Logs (as JSON):
 #   ENTER add args=(2, 3) kwargs={}
 #   EXIT  add return=5 cost_ms=0.012
 ```
 
-If the wrapped function raises, the decorator emits a `RAISE` record with the exception attached and re-raises:
+It works on methods the same way — no `self._logger` attribute, no setup:
 
+```python
+class Service:
+    @log_call(log)
+    def handle(self, payload: dict) -> None:
+        ...
+# Logs use the qualified name, so methods are easy to tell apart:
+#   ENTER Service.handle args=({...},) kwargs={}
 ```
-RAISE add after 0.142ms     (with full exc info captured)
+
+Omit the logger to auto-resolve `logging.getLogger(func.__module__)` — the stdlib "one logger per module" idiom:
+
+```python
+@log_call()  # uses logging.getLogger(__name__) of the module the function lives in
+def compute() -> int:
+    ...
 ```
 
 Override the level if you want:
 
 ```python
-@func_log.log_func(level=logging.DEBUG)
-def expensive_op(payload: dict) -> dict: ...
+@log_call(log, level=logging.DEBUG)
+def chatty(): ...
 ```
 
-### `ClassFunctionLogger` — for instance methods
+If the wrapped callable raises, `log_call` emits a `RAISE` record (with full exception info: stack trace + locals) and re-raises:
 
-Pulls a logger out of an instance attribute (default `_logger`):
-
-```python
-from task_logging import ClassFunctionLogger
-
-method_log = ClassFunctionLogger()
-
-class Service:
-    def __init__(self) -> None:
-        self._logger = logging.getLogger(__name__)
-
-    @method_log.log_func()
-    def handle(self, payload: dict) -> None:
-        ...
 ```
-
-Use a different attribute name if you want: `ClassFunctionLogger(logger_attr="task_log")`.
-
-If the instance has no such attribute, the decorator silently calls the method without logging — handy for opting individual instances out.
+RAISE add after 0.142ms     (exc=ValueError: nope)
+```
 
 ---
 
@@ -377,8 +371,7 @@ from task_logging import (
     unbind_task_context,
     get_task_id,          # read the active task_id
     get_task_context,     # read the full active context dict
-    FunctionLogger,
-    ClassFunctionLogger,
+    log_call,             # decorator: ENTER / EXIT / RAISE for any callable
     TaskContextFilter,    # the underlying logging.Filter
     JsonFormatter,        # the underlying logging.Formatter
 )
@@ -390,8 +383,7 @@ from task_logging import (
 | `task_context(task_id=..., **extra)` | Context manager that binds fields onto every log inside the block. |
 | `bind_task_context(**extra)` / `unbind_task_context(token)` | Imperative pair for non-`with` use. |
 | `get_task_id()` / `get_task_context()` | Read the currently active context. |
-| `FunctionLogger(logger).log_func(level=...)` | Decorator factory for functions. |
-| `ClassFunctionLogger(logger_attr="_logger").log_func(level=...)` | Decorator factory for methods. |
+| `log_call(logger=None, *, level=logging.INFO)` | Decorator that logs ENTER / EXIT / RAISE for the wrapped callable. `logger=None` auto-resolves to the function's module logger. |
 | `TaskContextFilter`, `JsonFormatter` | Exposed for advanced setups (e.g. attaching to a custom handler). |
 
 ---
@@ -400,12 +392,7 @@ from task_logging import (
 
 ```python
 import logging
-from task_logging import (
-    ClassFunctionLogger,
-    FunctionLogger,
-    setup_logging,
-    task_context,
-)
+from task_logging import log_call, setup_logging, task_context
 
 setup_logging(
     service="Billing",
@@ -415,26 +402,21 @@ setup_logging(
 )
 
 log = logging.getLogger(__name__)
-func_log = FunctionLogger(logger=log)
-method_log = ClassFunctionLogger()
 
 
-@func_log.log_func()
+@log_call(log)
 def charge(amount: float, currency: str) -> str:
     return f"charged {amount} {currency}"
 
 
 class Settlement:
-    def __init__(self) -> None:
-        self._logger = log
-
-    @method_log.log_func(level=logging.DEBUG)
+    @log_call(log, level=logging.DEBUG)
     def settle(self, account: str) -> None:
-        self._logger.info("settling %s", account)
+        log.info("settling %s", account)
         try:
             1 / 0
         except ZeroDivisionError:
-            self._logger.exception("settlement failed")
+            log.exception("settlement failed")
 
 
 def handle_request(req):

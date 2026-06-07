@@ -9,10 +9,9 @@ from pathlib import Path
 import pytest
 
 from task_logging import (
-    ClassFunctionLogger,
-    FunctionLogger,
     bind_task_context,
     get_task_id,
+    log_call,
     setup_logging,
     task_context,
     unbind_task_context,
@@ -181,29 +180,28 @@ def test_quiet_loggers_are_silenced(log_file: Path) -> None:
     assert record["msg"] == "should pass"
 
 
-def test_function_logger_emits_enter_and_exit(log_file: Path) -> None:
+def test_log_call_emits_enter_and_exit(log_file: Path) -> None:
     setup_logging(service="svc", log_file=log_file, console=False)
     log = logging.getLogger("biz")
-    func_log = FunctionLogger(logger=log)
 
-    @func_log.log_func()
+    @log_call(log)
     def add(x: int, y: int) -> int:
         return x + y
 
     assert add(2, 3) == 5
 
     msgs = [r["msg"] for r in _read_json_lines(log_file)]
-    assert msgs[0].startswith("ENTER add")
-    assert msgs[1].startswith("EXIT add")
+    assert msgs[0].startswith("ENTER")
+    assert "add" in msgs[0]
+    assert msgs[1].startswith("EXIT")
     assert "return=5" in msgs[1]
 
 
-def test_function_logger_logs_exception_and_reraises(log_file: Path) -> None:
+def test_log_call_logs_exception_and_reraises(log_file: Path) -> None:
     setup_logging(service="svc", log_file=log_file, console=False)
     log = logging.getLogger("biz")
-    func_log = FunctionLogger(logger=log)
 
-    @func_log.log_func()
+    @log_call(log)
     def boom() -> None:
         raise ValueError("nope")
 
@@ -211,21 +209,21 @@ def test_function_logger_logs_exception_and_reraises(log_file: Path) -> None:
         boom()
 
     records = _read_json_lines(log_file)
-    assert any(r["msg"].startswith("ENTER boom") for r in records)
-    raise_records = [r for r in records if r["msg"].startswith("RAISE boom")]
+    assert any(r["msg"].startswith("ENTER") and "boom" in r["msg"] for r in records)
+    raise_records = [
+        r for r in records if r["msg"].startswith("RAISE") and "boom" in r["msg"]
+    ]
     assert len(raise_records) == 1
     assert raise_records[0]["exc"]["name"] == "ValueError"
 
 
-def test_class_function_logger_uses_instance_logger(log_file: Path) -> None:
+def test_log_call_decorates_a_method_without_any_class_setup(log_file: Path) -> None:
+    """Method use case: no `self._logger`, no extra plumbing required."""
     setup_logging(service="svc", log_file=log_file, console=False)
-    method_log = ClassFunctionLogger()
+    log = logging.getLogger("biz.service")
 
     class Service:
-        def __init__(self) -> None:
-            self._logger = logging.getLogger("biz.service")
-
-        @method_log.log_func()
+        @log_call(log)
         def handle(self, n: int) -> int:
             return n * 2
 
@@ -233,23 +231,38 @@ def test_class_function_logger_uses_instance_logger(log_file: Path) -> None:
 
     records = _read_json_lines(log_file)
     assert records[0]["logger"] == "biz.service"
-    assert records[0]["msg"].startswith("ENTER handle")
+    # qualname includes the class, so we can tell methods from functions in logs.
+    assert "Service.handle" in records[0]["msg"]
     assert "return=14" in records[1]["msg"]
 
 
-def test_class_function_logger_silently_skips_when_attr_missing(
-    log_file: Path,
-) -> None:
+def test_log_call_auto_resolves_logger_from_module(log_file: Path) -> None:
+    """When `logger` is omitted, fall back to logging.getLogger(func.__module__)."""
     setup_logging(service="svc", log_file=log_file, console=False)
-    method_log = ClassFunctionLogger()
 
-    class Service:
-        @method_log.log_func()
-        def handle(self) -> str:
-            return "ok"
+    @log_call()
+    def compute() -> int:
+        return 42
 
-    assert Service().handle() == "ok"
-    assert _read_json_lines(log_file) == []
+    assert compute() == 42
+
+    records = _read_json_lines(log_file)
+    # The decorated function lives in this test module, so its logger should too.
+    assert records[0]["logger"] == compute.__module__
+    assert records[0]["logger"] == __name__
+
+
+def test_log_call_respects_custom_level(log_file: Path) -> None:
+    setup_logging(service="svc", log_file=log_file, console=False, level=logging.DEBUG)
+    log = logging.getLogger("biz")
+
+    @log_call(log, level=logging.DEBUG)
+    def step() -> str:
+        return "ok"
+
+    step()
+    records = _read_json_lines(log_file)
+    assert all(r["level"] == "DEBUG" for r in records)
 
 
 def test_context_isolated_across_threads(log_file: Path) -> None:

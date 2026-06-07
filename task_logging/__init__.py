@@ -9,8 +9,7 @@ Public API:
     unbind_task_context    - companion to bind_task_context
     get_task_id            - read the active task_id
     get_task_context       - read the full active context dict
-    FunctionLogger         - decorator: log enter/exit/timing for functions
-    ClassFunctionLogger    - decorator: same, for instance methods
+    log_call               - decorator: log enter/exit/timing for any callable
     TaskContextFilter      - the underlying logging.Filter
     JsonFormatter          - the underlying JSON logging.Formatter
 """
@@ -22,19 +21,18 @@ from .context import (
     task_context,
     unbind_task_context,
 )
-from .decorators import ClassFunctionLogger, FunctionLogger
+from .decorators import log_call
 from .filters import TaskContextFilter
 from .formatters import JsonFormatter
 from .setup import setup_logging
 
 __all__: list[str] = [
-    "ClassFunctionLogger",
-    "FunctionLogger",
     "JsonFormatter",
     "TaskContextFilter",
     "bind_task_context",
     "get_task_context",
     "get_task_id",
+    "log_call",
     "setup_logging",
     "task_context",
     "unbind_task_context",
