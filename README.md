@@ -6,7 +6,7 @@
 
 Task-aware **structured logging** for distributed Python services.
 
-The library plugs into Python's stdlib `logging`, tags every record with a `task_id` (propagated automatically through threads and asyncio tasks), and writes JSON to a log file. A sidecar **Grafana Alloy** agent tails the file, ships it to **Loki**, and you query it through **Grafana** with LogQL.
+The library plugs into Python's stdlib `logging`, tags every record with a `task_id` (propagated automatically through threads and asyncio tasks), and writes JSON to **stdout**. The container runtime captures stdout, **Grafana Alloy** scrapes it, ships it to **Loki**, and you query it through **Grafana** with LogQL.
 
 ```
 ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
@@ -14,10 +14,14 @@ The library plugs into Python's stdlib `logging`, tags every record with a `task
 │  stdlib logging│    │  stdlib logging│    │  stdlib logging│
 │  + task_logging│    │  + task_logging│    │  + task_logging│
 └───────┬────────┘    └───────┬────────┘    └───────┬────────┘
-        │ JSON file           │ JSON file           │ JSON file
+        │ JSON to stdout      │ JSON to stdout      │ JSON to stdout
         ▼                     ▼                     ▼
 ┌────────────────────────────────────────────────────────────┐
-│                    Grafana Alloy (tails files)             │
+│   Container runtime (Docker / Kubernetes) captures stdout  │
+└──────────────────────────────┬─────────────────────────────┘
+                               ▼
+┌────────────────────────────────────────────────────────────┐
+│      Grafana Alloy (discovers + scrapes containers)        │
 └──────────────────────────────┬─────────────────────────────┘
                                ▼
                        ┌──────────────┐
@@ -33,11 +37,11 @@ The library plugs into Python's stdlib `logging`, tags every record with a `task
 
 ## Why this design?
 
-- **One central place for logs.** All services write JSON to local files; Alloy ships them to a single Loki, queryable from one Grafana instance.
+- **One central place for logs.** All services write JSON to stdout; the container runtime captures it; Alloy ships it to a single Loki, queryable from one Grafana instance.
 - **Trace a single request across services.** Every log line carries `task_id`, `service`, `hostname`, etc. Pick any of them in Grafana and follow the request end-to-end.
 - **Third-party logs come along for free.** Because the library plugs into the stdlib root logger, anything that uses `logging` — `requests`, `urllib3`, `boto3`, `sqlalchemy`, your own modules — automatically gets the same JSON pipeline and the same `task_id` tag.
 - **Loki-friendly schema.** `service` / `env` / `level` are low-cardinality (good Loki labels). `task_id` and friends live inside the log line so they don't blow up Loki's stream cardinality.
-- **App stays simple.** No HTTP, no batching, no retries in app code — just `RotatingFileHandler`. Disk is the buffer; Alloy handles backpressure and reliability.
+- **App stays simple — and 12-factor.** No log files, no rotation knobs, no HTTP, no batching, no retries. Just `print` to stdout (effectively). The platform handles capture, rotation, and shipping. See [12factor.net/logs](https://12factor.net/logs).
 
 ---
 
@@ -67,14 +71,19 @@ from task_logging import setup_logging
 
 setup_logging(
     service="OrderService",                       # used as a Loki label
-    log_file="/var/log/order-service/app.log",    # what Alloy will tail
     env="prod",
     level=logging.INFO,
     quiet_loggers={"urllib3": logging.WARNING},   # tame noisy libs
 )
 ```
 
-After this, **every** stdlib logger in the process — yours and third-party — emits JSON to `app.log`.
+After this, **every** stdlib logger in the process — yours and third-party — writes to **stdout**.
+
+Format auto-detection:
+- In a container or when stdout is piped → **JSON**, ready for Alloy.
+- At an interactive terminal → **human-readable text**, easy to scan.
+
+Force one or the other with `setup_logging(..., json_format=True | False)`.
 
 ### 2. Use stdlib logging the normal way
 
@@ -238,7 +247,30 @@ RAISE add after 0.142ms     (exc=ValueError: nope)
 
 ## Deployment: Loki + Alloy + Grafana
 
-You don't need anything fancy. A `docker-compose.yml` with three services is enough to start.
+A `docker-compose.yml` with Loki, Grafana, Alloy, and your services is enough to start. Alloy uses **Docker socket discovery** to scrape every container's stdout — no per-service file mounts, no rotation config.
+
+### Tag your service containers
+
+Alloy reads container labels to figure out the `service` / `env` to attach to logs. Add labels to each app service:
+
+```yaml
+services:
+  order-service:
+    image: my-org/order-service:latest
+    labels:
+      - "logging=true"               # opt this container in
+      - "logging.service=OrderService"
+      - "logging.env=prod"
+
+  billing:
+    image: my-org/billing:latest
+    labels:
+      - "logging=true"
+      - "logging.service=Billing"
+      - "logging.env=prod"
+```
+
+(Pick the label keys you like — Alloy lets you map any label to a Loki label. The keys above match the example Alloy config below.)
 
 ### `docker-compose.yml`
 
@@ -256,9 +288,9 @@ services:
     command: run --server.http.listen-addr=0.0.0.0:12345 /etc/alloy/config.alloy
     volumes:
       - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
-      # Mount the host log directory(ies) you want to ship.
-      - /var/log/order-service:/var/log/order-service:ro
-      - /var/log/billing:/var/log/billing:ro
+      # Mount the Docker socket so Alloy can discover and scrape sibling
+      # containers' stdout. Read-only is enough.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     ports: ["12345:12345"]
     depends_on: [loki]
 
@@ -279,22 +311,48 @@ volumes:
 ### `alloy/config.alloy`
 
 ```alloy
-// Tail JSON log files. Each `targets` entry becomes a Loki stream with the
-// labels you list — keep the label set SMALL and LOW-CARDINALITY.
-local.file_match "services" {
-  path_targets = [
-    {__path__ = "/var/log/order-service/*.log", service = "OrderService", env = "prod"},
-    {__path__ = "/var/log/billing/*.log",       service = "Billing",      env = "prod"},
-  ]
+// Discover all running containers via the Docker socket.
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
 }
 
-loki.source.file "services" {
-  targets    = local.file_match.services.targets
+// Keep only containers explicitly opted in via `logging=true`, and promote
+// their labels into Prometheus-style targets that loki.source.docker can scrape.
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Drop containers that didn't opt in.
+  rule {
+    source_labels = ["__meta_docker_container_label_logging"]
+    regex         = "true"
+    action        = "keep"
+  }
+
+  // Map container labels to Loki labels (low-cardinality only).
+  rule {
+    source_labels = ["__meta_docker_container_label_logging_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_logging_env"]
+    target_label  = "env"
+  }
+  // The container name is also useful for distinguishing replicas.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    target_label  = "container"
+  }
+}
+
+// Read each opted-in container's stdout/stderr.
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
   forward_to = [loki.process.parse.receiver]
 }
 
-// Parse JSON, promote `level` to a label, drop the rest into structured metadata
-// so it's queryable but doesn't create new streams.
+// Parse the JSON line, promote `level` to a Loki label, push `task_id`
+// into structured metadata (high-cardinality but still filterable).
 loki.process "parse" {
   forward_to = [loki.write.default.receiver]
 
@@ -312,7 +370,7 @@ loki.process "parse" {
   }
 
   stage.labels {
-    values = { level = "" }   // level is a low-cardinality label
+    values = { level = "" }   // level is a low-cardinality Loki label
   }
 
   stage.structured_metadata {
@@ -353,11 +411,14 @@ Add Loki as a Grafana data source (`http://loki:3100`), then explore:
 
 # filter on a structured field
 {service="Billing"} | json | user_id="u-42"
+
+# isolate one container replica
+{service="OrderService", container="order-service-2"}
 ```
 
 ### Kubernetes note
 
-In a Kubernetes cluster, the canonical setup is to deploy Alloy as a **DaemonSet** and have it tail `/var/log/containers/*.log` instead of a per-service path — your apps just write JSON to **stdout** and the kubelet handles the file persistence. Same `loki.process` pipeline applies. See the official [Alloy install docs](https://grafana.com/docs/alloy/latest/set-up/install/kubernetes/) for the helm chart.
+In a Kubernetes cluster, replace `discovery.docker` with `discovery.kubernetes` and deploy Alloy as a **DaemonSet**. The kubelet already captures every container's stdout into `/var/log/containers/*.log`; Alloy tails those files and uses the pod's labels / annotations (instead of Docker labels) to attach `service` / `env`. Same `loki.process` JSON pipeline applies. See the official [Alloy install docs](https://grafana.com/docs/alloy/latest/set-up/install/kubernetes/) for the helm chart.
 
 ---
 
@@ -379,7 +440,7 @@ from task_logging import (
 
 | Symbol | Purpose |
 |---|---|
-| `setup_logging(service=..., log_file=..., ...)` | One-shot configuration of the root logger. |
+| `setup_logging(service=..., env=..., level=..., json_format=None, ...)` | One-shot configuration of the root logger. Writes to stdout. `json_format=None` auto-detects (JSON when not at a TTY, human text when at one). |
 | `task_context(task_id=..., **extra)` | Context manager that binds fields onto every log inside the block. |
 | `bind_task_context(**extra)` / `unbind_task_context(token)` | Imperative pair for non-`with` use. |
 | `get_task_id()` / `get_task_context()` | Read the currently active context. |
@@ -396,7 +457,6 @@ from task_logging import log_call, setup_logging, task_context
 
 setup_logging(
     service="Billing",
-    log_file="/var/log/billing/app.log",
     env="prod",
     quiet_loggers={"urllib3": logging.WARNING, "botocore": logging.WARNING},
 )
@@ -425,7 +485,7 @@ def handle_request(req):
         Settlement().settle("acct-1")
 ```
 
-After this runs, every line in `/var/log/billing/app.log` is JSON tagged with the request's `task_id` and `user_id` — including any logs from `requests`, `urllib3`, `botocore`, etc. that fired during the request.
+When this runs in a container, every line of stdout is JSON tagged with the request's `task_id` and `user_id` — including any logs from `requests`, `urllib3`, `botocore`, etc. that fired during the request. Alloy picks the lines up via the Docker socket, attaches the `service=Billing` / `env=prod` labels from the container's labels, and ships them to Loki.
 
 ---
 

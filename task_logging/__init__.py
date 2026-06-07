@@ -1,6 +1,6 @@
 """Task-aware structured logging for distributed Python services.
 
-Pipeline:  app  ──stdlib logging──▶  JSON file  ──Alloy tail──▶  Loki  ──▶  Grafana
+Pipeline:  app  ──stdlib logging──▶  stdout (JSON)  ──Alloy scrape──▶  Loki  ──▶  Grafana
 
 Public API:
     setup_logging          - install handlers/filters on the root logger

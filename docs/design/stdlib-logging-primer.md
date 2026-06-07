@@ -314,23 +314,21 @@ Two methods worth knowing:
 Now you can read the whole flow without surprise:
 
 ```python
-def setup_logging(*, service, log_file, env=None, level=INFO, ...):
+def setup_logging(*, service, env=None, level=INFO, json_format=None, ...):
     root = logging.getLogger()                # the tree's root
     root.setLevel(level)                      # global threshold
 
-    ctx_filter   = TaskContextFilter(service, env)
-    json_formatter = JsonFormatter()
+    ctx_filter = TaskContextFilter(service, env)
+    formatter = (
+        JsonFormatter() if (json_format if json_format is not None
+                            else not sys.stdout.isatty())
+        else _HumanFormatter()
+    )
 
-    file_handler = RotatingFileHandler(log_file, ...)
-    file_handler.setFormatter(json_formatter) # how to render
-    file_handler.addFilter(ctx_filter)        # what to enrich
-    root.addHandler(file_handler)             # attach to ROOT
-
-    if console:
-        console_handler = StreamHandler(sys.stderr)
-        console_handler.setFormatter(_HumanFormatter())
-        console_handler.addFilter(ctx_filter)
-        root.addHandler(console_handler)
+    handler = StreamHandler(sys.stdout)       # one handler, stdout
+    handler.setFormatter(formatter)           # how to render
+    handler.addFilter(ctx_filter)             # what to enrich
+    root.addHandler(handler)                  # attach to ROOT
 ```
 
 When `urllib3.connectionpool` later does `log.warning("retrying")`:
@@ -339,14 +337,14 @@ When `urllib3.connectionpool` later does `log.warning("retrying")`:
 2. Effective level check: `urllib3.connectionpool` has no level →
    `urllib3` has WARNING (set via `quiet_loggers`) → passes.
 3. `callHandlers` walks up the tree: `urllib3.connectionpool` (no
-   handlers) → `urllib3` (no handlers) → root (has our two handlers).
-4. For each root handler:
+   handlers) → `urllib3` (no handlers) → root (has our stdout handler).
+4. The handler:
    - Check handler level (default NOTSET → pass)
    - Run handler filters: `TaskContextFilter` runs, stamps
      `record.task_id = current_task_id_from_contextvar`, returns `True`
    - Format: `JsonFormatter.format(record)` reads the freshly-stamped
      fields and emits a JSON line
-   - Write to the file
+   - Write to stdout — the container runtime captures it from there.
 5. Done.
 
 Notice nothing in `urllib3` was modified. The whole effect comes from

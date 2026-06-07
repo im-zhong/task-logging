@@ -2,8 +2,8 @@
 
 Call `setup_logging()` once at process startup. Everything that uses stdlib
 `logging` afterwards — your code, `requests`, `urllib3`, `boto3`, … — will be
-captured and written as JSON to the configured log file (and optionally to the
-console for humans).
+captured and written to stdout (as JSON for Alloy, or as human-readable text
+when running interactively).
 
 Why install handlers on the ROOT logger (not on a per-module logger):
     stdlib propagation walks records UP the logger tree until it hits a
@@ -12,30 +12,34 @@ Why install handlers on the ROOT logger (not on a per-module logger):
     one handler, gets enriched by exactly one filter, and is formatted by
     exactly one formatter. One source of truth for log shape.
 
-Why ship to a FILE for Alloy to tail (not push to Loki directly):
-    Loki accepts pushes via HTTP, but writing files and letting Alloy ship
-    them is the Grafana-recommended path:
-      - the app stays trivial (FileHandler + Formatter, no HTTP, no async
-        queue, no retry logic)
-      - if Loki is down or slow, the file is the buffer; Alloy handles
-        backpressure and reliability with WAL
-      - if the app crashes, every flushed line is on disk
-      - one Alloy process can ship logs from many services on the same host
-    See docs/design/why-json-logs.md for the format choice and the README's
-    "Deployment" section for the Alloy config.
+Why write to STDOUT (not a file):
+    The library targets containerised deployments, where the platform — Docker
+    daemon, Kubernetes kubelet, systemd-journald, an Alloy DaemonSet — already
+    captures stdout into a durable, rotated location. Writing files from the
+    app would just duplicate that work and add per-service mounts, log-dir
+    permissions, and rotation tuning to the deployment surface. The 12-factor
+    rule (https://12factor.net/logs) is "treat logs as event streams; the app
+    writes unbuffered to stdout, the environment routes them."
+    With Alloy: `discovery.docker` (or `loki.source.kubernetes`) tails container
+    stdout directly. No app-level file mounts. Multiple replicas of the same
+    service show up as separate Loki streams automatically via container labels.
 
-See docs/design/stdlib-logging-primer.md for the stdlib mechanics this
-file relies on.
+Why JSON when not at a TTY, human-readable when at one:
+    A developer running `python -m myapp` at a terminal wants readable output;
+    a container in production wants JSON for Alloy's `stage.json`. We detect
+    which one we're in via `stdout.isatty()` by default, and let the user
+    force it either way with `json_format=True` / `False`.
+
+See docs/design/why-json-logs.md for the format choice and the README's
+"Deployment" section for the Alloy config. See docs/design/stdlib-logging-primer.md
+for the stdlib mechanics this file relies on.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import sys
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from .filters import TaskContextFilter
 from .formatters import JsonFormatter
@@ -48,44 +52,40 @@ _HANDLER_TAG = "task_logging.handler"
 def setup_logging(
     *,
     service: str,
-    log_file: str | os.PathLike[str] | None = None,
     env: str | None = None,
     level: int | str = logging.INFO,
-    console: bool = True,
-    console_json: bool = False,
+    json_format: bool | None = None,
+    stream: IO[str] | None = None,
     capture_locals: bool = True,
-    rotate_max_bytes: int = 100 * 1024 * 1024,
-    rotate_backup_count: int = 5,
     static_fields: dict[str, Any] | None = None,
     quiet_loggers: dict[str, int] | None = None,
 ) -> logging.Logger:
-    """Configure the root logger for Loki / Alloy ingestion.
+    """Configure the root logger to write to stdout for Alloy / Loki ingestion.
 
     Args:
         service:
             Service name. Becomes a Loki label via Alloy and is stamped on
             every log record. **Use a low-cardinality value** (e.g.
             "OrderService"), not something per-request.
-        log_file:
-            Path to the JSON log file Alloy will tail. Required for shipping
-            to Loki. If None, no file handler is installed (useful in tests).
-            Parent directory is created automatically.
         env:
             Optional environment label, e.g. "prod" / "dev".
         level:
             Root log level. Stdlib levels (`logging.INFO`) or names ("INFO").
-        console:
-            If True, also write to stderr. Default True.
-        console_json:
-            If True, the console handler emits JSON too. If False (default),
-            it emits a human-readable single-line format. The file handler
-            is always JSON.
+        json_format:
+            How to render each record:
+                - True  → always JSON (use this in containers / production).
+                - False → always human-readable text (use at a terminal).
+                - None (default) → auto-detect: JSON when stdout is not a
+                  TTY (containers, pipes), text when it is (interactive
+                  terminals).
+        stream:
+            The stream to write to. Defaults to `sys.stdout`. Override for
+            tests or unusual deployments where you want the records routed
+            elsewhere (e.g. a `StringIO` in tests).
         capture_locals:
             If True, exception logs include a repr-snapshot of the local
             variables at the deepest frame. Disable in low-trust environments
             where locals might leak secrets.
-        rotate_max_bytes / rotate_backup_count:
-            `RotatingFileHandler` knobs. Defaults: 100 MiB × 5.
         static_fields:
             Extra fields stamped on every record (e.g. `{"region": "us-west-2"}`).
         quiet_loggers:
@@ -96,12 +96,19 @@ def setup_logging(
         The configured root logger.
 
     Example:
-        >>> setup_logging(
-        ...     service="OrderService",
-        ...     log_file="/var/log/order-service/app.log",
-        ...     env="prod",
-        ...     quiet_loggers={"urllib3": logging.WARNING},
-        ... )
+        Production (in a Docker container) — stdout is not a TTY, so we
+        emit JSON automatically::
+
+            setup_logging(
+                service="OrderService",
+                env="prod",
+                quiet_loggers={"urllib3": logging.WARNING},
+            )
+
+        Development at a terminal — auto-detected human-readable text. Or
+        force one format explicitly::
+
+            setup_logging(service="OrderService", json_format=False)
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -117,55 +124,31 @@ def setup_logging(
             root.removeHandler(h)
             h.close()
 
-    # The filter and JSON formatter are SHARED between handlers — one
-    # filter instance running once per record, one formatter instance
-    # used by both handlers when console_json=True. Both are stateless
-    # after construction so sharing is safe.
+    target_stream = stream if stream is not None else sys.stdout
+
+    # Auto-detect JSON vs human format from TTY status if not explicitly set.
+    # `isatty()` may not exist on every stream-like object (e.g. StringIO in
+    # tests has it; arbitrary file-likes might not), so guard with getattr.
+    if json_format is None:
+        isatty = getattr(target_stream, "isatty", None)
+        json_format = not (callable(isatty) and isatty())
+
     ctx_filter = TaskContextFilter(service=service, env=env, extra=static_fields)
-    json_formatter = JsonFormatter(capture_locals=capture_locals)
+    formatter: logging.Formatter = (
+        JsonFormatter(capture_locals=capture_locals)
+        if json_format
+        else _HumanFormatter()
+    )
 
-    if log_file is not None:
-        path = Path(log_file)
-        # Create the parent directory for the user — a missing log dir is the
-        # single most common configuration error and a fail-fast that produces
-        # `FileNotFoundError` at startup is worse than just creating it.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # RotatingFileHandler (size-based) is chosen over TimedRotatingFileHandler
-        # because Alloy doesn't care about rotation cadence — it follows
-        # rotated files via inode tracking — and size caps are a hard ceiling
-        # against runaway disk usage. 100MiB × 5 = 500MiB worst case, fine for
-        # a single service on a normal host.
-        file_handler = RotatingFileHandler(
-            filename=path,
-            maxBytes=rotate_max_bytes,
-            backupCount=rotate_backup_count,
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(json_formatter)
-        # Filter on the HANDLER, not on the root logger. Logger-filters only
-        # see records emitted directly on that logger, not propagated child
-        # records. Handler-filters see every record that reaches the handler,
-        # which is what we want for whole-process enrichment.
-        file_handler.addFilter(ctx_filter)
-        _tag(file_handler)
-        root.addHandler(file_handler)
-
-    if console:
-        # Console writes to stderr (stdlib convention for diagnostic output;
-        # keeps stdout clean for the program's "real" output).
-        console_handler = logging.StreamHandler(stream=sys.stderr)
-        # Default to a human-readable formatter on the console — JSON is for
-        # machines (Alloy reads the file), text is for humans (you read the
-        # terminal). Toggle `console_json=True` if you also want a machine-
-        # readable stdout for, e.g., Kubernetes log shipping where the kubelet
-        # captures stdout into /var/log/containers and Alloy tails THAT.
-        if console_json:
-            console_handler.setFormatter(json_formatter)
-        else:
-            console_handler.setFormatter(_HumanFormatter())
-        console_handler.addFilter(ctx_filter)
-        _tag(console_handler)
-        root.addHandler(console_handler)
+    handler = logging.StreamHandler(stream=target_stream)
+    handler.setFormatter(formatter)
+    # Filter on the HANDLER, not on the root logger. Logger-filters only see
+    # records emitted directly on that logger, not propagated child records.
+    # Handler-filters see every record that reaches the handler, which is
+    # what we want for whole-process enrichment.
+    handler.addFilter(ctx_filter)
+    _tag(handler)
+    root.addHandler(handler)
 
     if quiet_loggers:
         # Setting a level on a parent logger silences every child below it
@@ -182,7 +165,7 @@ def _tag(handler: logging.Handler) -> None:
 
 
 class _HumanFormatter(logging.Formatter):
-    """A compact, human-friendly console format that surfaces the task_id."""
+    """A compact, human-friendly format that surfaces the task_id."""
 
     def format(self, record: logging.LogRecord) -> str:
         task_id = getattr(record, "task_id", None)

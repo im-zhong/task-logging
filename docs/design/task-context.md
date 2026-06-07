@@ -135,11 +135,11 @@ class TaskContextFilter(logging.Filter):
         return True
 ```
 
-`setup_logging` attaches this filter to the file handler (and the console
-handler). So every record emitted by **any** logger in the process — your
-code, `urllib3`, `boto3`, anything — passes through this filter on its way
-to the handler, and gets `record.task_id`, `record.service`, plus every
-key in the active context dict, slapped onto it as an attribute.
+`setup_logging` attaches this filter to the stdout handler. So every
+record emitted by **any** logger in the process — your code, `urllib3`,
+`boto3`, anything — passes through this filter on its way out, and gets
+`record.task_id`, `record.service`, plus every key in the active context
+dict, slapped onto it as an attribute.
 
 Then `JsonFormatter` reads those attributes off the record and writes them
 as JSON.
@@ -195,16 +195,16 @@ mechanisms used as designed.
 Here's what happens when you write:
 
 ```python
-setup_logging(service="OrderService", log_file="/var/log/app.log")
+setup_logging(service="OrderService")
 log = logging.getLogger("biz")
 
 with task_context(task_id="task-42", user_id="u-1"):
     log.info("hello")
 ```
 
-1. `setup_logging` creates a `RotatingFileHandler`, attaches a
-   `TaskContextFilter(service="OrderService")` and a `JsonFormatter`, and
-   adds the handler to the **root** logger.
+1. `setup_logging` creates a `StreamHandler(sys.stdout)`, attaches a
+   `TaskContextFilter(service="OrderService")` and a `JsonFormatter`,
+   and adds the handler to the **root** logger.
 
 2. `task_context(...)` builds `{"task_id": "task-42", "user_id": "u-1"}`
    and calls `_task_ctx.set(...)`, getting back a token.
@@ -224,12 +224,15 @@ with task_context(task_id="task-42", user_id="u-1"):
    {"ts":"...","level":"INFO","msg":"hello","service":"OrderService","task_id":"task-42","user_id":"u-1",...}
    ```
 
-6. The handler writes that line to `/var/log/app.log`.
+6. The handler writes that line to **stdout**. The container runtime
+   (Docker daemon / Kubernetes kubelet) captures it into its standard
+   per-container log location.
 
 7. The `with` block exits. `_task_ctx.reset(token)` restores the prior
    state. Any logs emitted after the block have `task_id: null`.
 
-8. Alloy tails the file, parses the JSON, ships it to Loki, and you query
+8. Alloy discovers the container via the Docker socket (or K8s API),
+   tails its stdout, parses the JSON, ships it to Loki, and you query
    `{service="OrderService"} | json | task_id="task-42"` in Grafana.
 
 ## Alternatives we rejected
@@ -259,5 +262,6 @@ JsonFormatter          →  reads those attributes off the record and
                           emits one line of JSON
 ```
 
-Everything else (Alloy tailing the file, Loki ingesting, Grafana
-querying) is plumbing layered on top of that JSON.
+Everything else (the container runtime capturing stdout, Alloy
+discovering and scraping it, Loki ingesting, Grafana querying) is
+plumbing layered on top of that JSON.

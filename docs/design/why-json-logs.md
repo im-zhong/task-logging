@@ -142,9 +142,10 @@ In a multi-service environment that's the right hill to die on.
 To be honest about the tradeoffs:
 
 1. **Humans can't read raw JSON logs as easily.** That's why
-   `setup_logging(console=True)` defaults to a human-readable text
-   formatter on stderr — JSON for the file (Alloy reads it), pretty text
-   for the terminal (you read it). Best of both.
+   `setup_logging` auto-detects: when stdout is a TTY (you're at a
+   terminal), it emits human-readable text; when stdout is a pipe
+   (containers, `docker logs`, anywhere Alloy is reading), it emits
+   JSON. Force one or the other with `json_format=True` / `False`.
 
 2. **Slightly larger on-disk footprint.** All those `"key":` repetitions
    add up. In practice Loki/Alloy compress chunks heavily and this
@@ -189,7 +190,8 @@ that JSON also happens to be Loki/Alloy's smoothest input format is icing.
   operator into typed queries, and preserve nested data like exception
   structures.
 - The one-line JSON contract is also the most durable choice for a
-  multi-service environment where the same log file might be consumed by
-  tools you haven't picked yet.
-- This library still emits human-readable text on the *console* — JSON is
-  for the file, where machines read it, not the terminal where you do.
+  multi-service environment where the same log stream might be consumed
+  by tools you haven't picked yet.
+- This library still emits human-readable text at an interactive
+  *terminal* — JSON is for non-TTY stdout, where machines read it (Alloy,
+  `docker logs | jq`, …), not the terminal where you do.
