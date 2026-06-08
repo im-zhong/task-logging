@@ -1,8 +1,9 @@
 """Top-level wiring: install handlers + filters on the root logger.
 
-Call `setup_logging()` once at process startup. Everything that uses stdlib
-`logging` afterwards — your code, `requests`, `urllib3`, `boto3`, … — will be
-captured and written to stdout as JSON, ready for Alloy / Loki ingestion.
+Call `setup_task_logging()` once at process startup. Everything that uses
+stdlib `logging` afterwards — your code, `requests`, `urllib3`, `boto3`, … —
+will be captured and written to stdout as JSON, ready for Alloy / Loki
+ingestion.
 
 Why install handlers on the ROOT logger (not on a per-module logger):
     stdlib propagation walks records UP the logger tree until it hits a
@@ -19,9 +20,10 @@ Why write to STDOUT (not a file):
     permissions, and rotation tuning to the deployment surface. The 12-factor
     rule (https://12factor.net/logs) is "treat logs as event streams; the app
     writes unbuffered to stdout, the environment routes them."
-    With Alloy: `discovery.docker` (or `loki.source.kubernetes`) tails container
-    stdout directly. No app-level file mounts. Multiple replicas of the same
-    service show up as separate Loki streams automatically via container labels.
+    With Alloy: `discovery.docker` (or `loki.source.kubernetes`) tails
+    container stdout directly. No app-level file mounts. Multiple replicas of
+    the same service show up as separate Loki streams automatically via
+    container labels.
 
 Why ALWAYS JSON (no human-readable mode):
     Two output formats means two code paths to test, two schemas to document,
@@ -29,12 +31,20 @@ Why ALWAYS JSON (no human-readable mode):
     With one format, what you see in Grafana is exactly what you see when you
     inspect locally. For human reading at a terminal, `docker logs <ctr> | jq`
     or any JSON pretty-printer is one pipe away — and shows the structured
-    fields (task_id, exc.locals_dict, ...) that a "pretty" formatter would
-    have hidden.
+    fields (e.g. `task_id`, `exc_info.locals_dict`, ...) that a "pretty"
+    formatter would have hidden.
+
+Why no domain-specific kwargs (no `service=`, no `env=`):
+    Earlier revisions had `setup_logging(service=..., env=...)`. We dropped
+    those: a logging library shouldn't decide what fields its users care
+    about. `global_log_attrs={...}` accepts any dict, with `service` /
+    `env` / `region` / whatever as conventions the user picks, not names
+    the library bakes in.
 
 See docs/design/why-json-logs.md for the format choice and the README's
-"Deployment" section for the Alloy config. See docs/design/stdlib-logging-primer.md
-for the stdlib mechanics this file relies on.
+"Deployment" section for the Alloy config. See
+docs/design/stdlib-logging-primer.md for the stdlib mechanics this file
+relies on.
 """
 
 from __future__ import annotations
@@ -43,33 +53,32 @@ import logging
 import sys
 from typing import IO, Any
 
-from .filters import TaskContextFilter
+from .filters import TaskLogFilter
 from .formatters import JsonFormatter
 
-# A stable name we attach to handlers we install, so repeated `setup_logging()`
-# calls (e.g. in tests) replace rather than stack.
+# A stable name we attach to handlers we install, so repeated
+# setup_task_logging() calls (e.g. in tests) replace rather than stack.
 _HANDLER_TAG = "task_logging.handler"
 
 
-def setup_logging(
+def setup_task_logging(
     *,
-    service: str,
-    env: str | None = None,
+    global_log_attrs: dict[str, Any] | None = None,
     level: int | str = logging.INFO,
     stream: IO[str] | None = None,
     capture_locals: bool = True,
-    static_fields: dict[str, Any] | None = None,
     quiet_loggers: dict[str, int] | None = None,
 ) -> logging.Logger:
     """Configure the root logger to write JSON to stdout for Alloy / Loki.
 
     Args:
-        service:
-            Service name. Becomes a Loki label via Alloy and is stamped on
-            every log record. **Use a low-cardinality value** (e.g.
-            "OrderService"), not something per-request.
-        env:
-            Optional environment label, e.g. "prod" / "dev".
+        global_log_attrs:
+            A dict of attrs stamped on every record for the lifetime of the
+            process. Pick whatever keys your domain wants — e.g.
+            ``{"service": "OrderService", "env": "prod", "region": "us"}``.
+            Any key colliding with a stdlib `LogRecord` attribute (or
+            `hostname`, which we auto-detect) is silently ignored to protect
+            record integrity.
         level:
             Root log level. Stdlib levels (`logging.INFO`) or names ("INFO").
         stream:
@@ -79,8 +88,6 @@ def setup_logging(
             If True, exception logs include a repr-snapshot of the local
             variables at the deepest frame. Disable in low-trust environments
             where locals might leak secrets.
-        static_fields:
-            Extra fields stamped on every record (e.g. `{"region": "us-west-2"}`).
         quiet_loggers:
             Map of logger name -> level. Useful for taming chatty third-party
             libraries, e.g. `{"urllib3": logging.WARNING}`.
@@ -89,9 +96,8 @@ def setup_logging(
         The configured root logger.
 
     Example:
-        >>> setup_logging(
-        ...     service="OrderService",
-        ...     env="prod",
+        >>> setup_task_logging(
+        ...     global_log_attrs={"service": "OrderService", "env": "prod"},
         ...     quiet_loggers={"urllib3": logging.WARNING},
         ... )
 
@@ -104,10 +110,10 @@ def setup_logging(
 
     # Idempotency: drop handlers we previously installed (identified by our
     # private tag) and leave foreign ones alone. Without this, calling
-    # setup_logging() twice (in tests, hot-reloads, multi-step bootstrap)
-    # would stack handlers and produce duplicated log lines. We don't blanket-
-    # remove all handlers because a host application may have legitimately
-    # installed its own (e.g. Sentry's breadcrumb handler).
+    # setup_task_logging() twice (in tests, hot-reloads, multi-step
+    # bootstrap) would stack handlers and produce duplicated log lines. We
+    # don't blanket-remove all handlers because a host application may have
+    # legitimately installed its own (e.g. Sentry's breadcrumb handler).
     for h in list(root.handlers):
         if getattr(h, "_task_logging_tag", None) == _HANDLER_TAG:
             root.removeHandler(h)
@@ -115,7 +121,7 @@ def setup_logging(
 
     target_stream = stream if stream is not None else sys.stdout
 
-    ctx_filter = TaskContextFilter(service=service, env=env, extra=static_fields)
+    ctx_filter = TaskLogFilter(global_log_attrs=global_log_attrs)
     formatter = JsonFormatter(capture_locals=capture_locals)
 
     handler = logging.StreamHandler(stream=target_stream)

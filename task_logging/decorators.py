@@ -1,19 +1,30 @@
-"""`@log_call` decorator: log entry args, exit value, and elapsed time.
+"""`@log_func_call` decorator: log entry args, exit value, and elapsed time.
 
 Works on plain functions and on instance / class / static methods alike. The
 logger is supplied explicitly at decoration time (or auto-resolved from the
 wrapped function's module), so the decorator imposes no requirements on the
 class it decorates.
 
+Why each word in the name pulls its weight:
+    - `log`  — uses logging (specifically the `logger` arg or the wrapped
+               function's module logger), distinguishing this from
+               OpenTelemetry-style `@trace` decorators that emit spans
+               instead.
+    - `func` — the decorator targets functions (and methods, which Python
+               models as functions). It does not, e.g., wrap arbitrary
+               callables or context managers.
+    - `call` — the decorator fires per-call, not per-function-definition.
+               One ENTER/EXIT/RAISE record per invocation.
+
 Why one decorator (not separate FunctionLogger / ClassFunctionLogger):
     The earlier two-class split existed because TaskLogger bound
     (service, task_id) to the logger instance, so methods needed a
     per-instance logger via self._logger. The contextvars-based rewrite moved
-    task_id off the logger entirely (it now flows through ContextVar), so
-    that whole motivation disappeared. Forcing classes to expose self._logger
-    became pure coupling — boilerplate, attribute-name collisions, and a
-    silent no-op when the attribute is missing — solving a problem that no
-    longer exists.
+    those attrs off the logger entirely (they now flow through ContextVar),
+    so that whole motivation disappeared. Forcing classes to expose
+    self._logger became pure coupling — boilerplate, attribute-name
+    collisions, and a silent no-op when the attribute is missing — solving
+    a problem that no longer exists.
 
 See docs/design/decorators.md for the full reasoning.
 """
@@ -30,12 +41,12 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
-def log_call(
+def log_func_call(
     logger: logging.Logger | None = None,
     *,
     level: int = logging.INFO,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Wrap a callable so each invocation emits ENTER / EXIT / RAISE records.
+    """Wrap a function so each invocation emits ENTER / EXIT / RAISE records.
 
     The wrapper logs:
         - ``ENTER <name> args=... kwargs=...`` before the call,
@@ -55,24 +66,24 @@ def log_call(
 
             log = logging.getLogger(__name__)
 
-            @log_call(log)
+            @log_func_call(log)
             def add(x: int, y: int) -> int:
                 return x + y
 
         Method — no special class setup required, no `self._logger`::
 
             class Service:
-                @log_call(log)
+                @log_func_call(log)
                 def handle(self, payload: dict) -> None: ...
 
         Auto-resolve logger from the function's module::
 
-            @log_call()  # uses logging.getLogger(__name__) of the caller
+            @log_func_call()  # uses logging.getLogger(func.__module__)
             def compute(): ...
 
         Custom level::
 
-            @log_call(log, level=logging.DEBUG)
+            @log_func_call(log, level=logging.DEBUG)
             def chatty(): ...
     """
 

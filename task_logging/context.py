@@ -1,17 +1,38 @@
-"""Task context propagation via contextvars.
+"""Task log context propagation via contextvars.
 
-`task_id` (and any extra fields you bind) flow through threads, asyncio tasks,
-and decorated function calls, then get attached to every `LogRecord` by
-`TaskContextFilter`.
+A `task_log_context` binds a dict of arbitrary log attrs (`task_id`, `user_id`,
+whatever your app's domain calls for) to the current execution context. Any log
+emitted inside that context — including from third-party libraries that use
+stdlib logging — gets those attrs attached to its `LogRecord` via
+`TaskLogFilter`.
+
+The context object supports both forms:
+
+    # `with` form — preferred
+    with task_log_context({"task_id": "abc"}):
+        log.info("...")
+
+    # imperative enter/exit — for middleware that has separate hook callbacks
+    ctx = task_log_context({"task_id": "abc"})
+    ctx.enter()
+    try:
+        log.info("...")
+    finally:
+        ctx.exit()
+
+`enter`/`exit` are explicit aliases of `__enter__`/`__exit__` — same single
+object, two usage forms. The library does NOT privilege any particular attr
+name (no auto-`task_id`, no domain-specific kwargs); the dict is whatever
+the caller decides.
 
 Why ContextVar (not threading.local, not LoggerAdapter, not extra=...):
     - threading.local breaks under asyncio: all coroutines on one event loop
-      share a thread, so they'd share the same task_id.
+      share a thread, so they'd share the same context.
     - LoggerAdapter requires every log site to use a special logger instance.
       It can't capture third-party libraries (`requests`, `urllib3`, ...) that
       call logging.getLogger("urllib3") themselves.
-    - extra={"task_id": ...} on every log call has the same problem and is
-      pure boilerplate.
+    - extra={...} on every log call has the same problem and is pure
+      boilerplate.
     ContextVars cover all three (threads, asyncio, opaque to user code) and
     are the stdlib's blessed mechanism for "ambient request-scoped state."
 
@@ -21,15 +42,13 @@ See docs/design/task-context.md for the full design discussion.
 from __future__ import annotations
 
 import contextvars
-import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
+from types import TracebackType
 from typing import Any
 
-# A single ContextVar holds the entire context dict so we can swap it atomically
-# in `task_context()` and restore it on exit via the token returned by .set().
+# A single ContextVar holds the entire log-attrs dict so we can swap it
+# atomically and restore it on exit via the token returned by .set().
 # Per-key ContextVars would also work, but a single var keeps the bookkeeping
-# simple and lets nested task_context() calls inherit the parent's keys with a
+# simple and lets nested task_log_contexts inherit the parent's keys with a
 # single dict merge.
 #
 # Default is None (not {}) — ContextVars MUST NOT have mutable defaults. The
@@ -37,77 +56,101 @@ from typing import Any
 # default would let one mutation leak into every other thread/task that has
 # never bound a context. ruff's B039 rule flags this exact bug. We allocate a
 # fresh dict every set() and treat None as "no context active."
-_task_ctx: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "task_logging_ctx", default=None
+_local_log_attrs: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("task_logging_local_log_attrs", default=None)
 )
 
 
-def get_task_context() -> dict[str, Any]:
-    """Return a shallow copy of the current task context."""
-    current = _task_ctx.get()
+def get_task_log_attrs() -> dict[str, Any]:
+    """Return a shallow copy of the currently-active task log attrs.
+
+    Combines all enclosing `task_log_context` blocks (inner overrides outer).
+    Returns an empty dict if no context is active.
+    """
+    current = _local_log_attrs.get()
     return dict(current) if current else {}
 
 
-def get_task_id() -> str | None:
-    """Return the current `task_id`, or None if no context is active."""
-    current = _task_ctx.get()
-    if not current:
-        return None
-    value = current.get("task_id")
-    return value if isinstance(value, str) else None
+class task_log_context:  # noqa: N801 (callable-named-as-class is intentional — it reads as a verb at the call site)
+    """Bind a dict of log attrs to the current execution context.
 
+    Logs emitted inside the active context — yours and third-party — will
+    carry these attrs in their JSON output. Nested contexts inherit and
+    override parent attrs (inner wins).
 
-@contextmanager
-def task_context(
-    task_id: str | None = None, **extra: Any
-) -> Iterator[dict[str, Any]]:
-    """Bind a task context for the duration of the `with` block.
+    The dict is the only positional argument and is **positional-only**: the
+    public API has no privileged attr names. Pick any keys your app cares
+    about (`task_id`, `request_id`, `user_id`, `region`, ...).
 
-    Any logs emitted inside the block — including from third-party libraries
-    that use stdlib logging — will be tagged with these fields.
+    Two equivalent usage forms:
 
-    Args:
-        task_id: The task id. If None, a uuid4 hex is generated.
-        **extra: Arbitrary extra fields to attach to every log record
-                 (e.g. `user_id="u-1"`, `request_id="r-9"`).
+        # `with` form — preferred
+        with task_log_context({"task_id": "abc"}):
+            log.info("processing")
 
-    Yields:
-        The merged context dict that is now active.
+        # imperative — for middleware split across hook callbacks
+        ctx = task_log_context({"task_id": "abc"})
+        ctx.enter()
+        try:
+            log.info("processing")
+        finally:
+            ctx.exit()
 
-    Example:
-        >>> with task_context(task_id="task-42", user_id="u-1"):
-        ...     logging.getLogger(__name__).info("processing")
+    The same instance can only be entered once. Re-entering an already-active
+    context raises RuntimeError; do not share an instance across threads or
+    repeated calls.
     """
-    # Inheritance: a nested task_context inherits everything its parent set.
-    # This matches user intent — a sub-task should see the request-scoped
-    # fields the outer task bound (region, user_id, ...) unless it explicitly
-    # overrides them. The inner task_id wins because dict-merge is left-to-right.
-    parent = _task_ctx.get() or {}
-    merged: dict[str, Any] = {**parent, **extra}
-    merged["task_id"] = task_id if task_id is not None else uuid.uuid4().hex
-    # ContextVar.set returns an opaque token that records EXACTLY what was
-    # there before. reset(token) restores precisely that, even under nesting
-    # and even when the body raises (the finally always runs). This is the
-    # stdlib's blessed pattern for save/restore; rolling our own would break
-    # under reentrancy.
-    token = _task_ctx.set(merged)
-    try:
-        yield merged
-    finally:
-        _task_ctx.reset(token)
 
+    __slots__ = ("_attrs", "_token")
 
-def bind_task_context(**extra: Any) -> contextvars.Token[dict[str, Any] | None]:
-    """Bind extra fields onto the current task context, returning a reset token.
+    def __init__(self, attrs: dict[str, Any] | None = None, /) -> None:
+        # We store a defensive copy so subsequent caller mutations to `attrs`
+        # don't bleed into the bound context after the fact.
+        self._attrs: dict[str, Any] = dict(attrs) if attrs else {}
+        self._token: contextvars.Token[dict[str, Any] | None] | None = None
 
-    Useful when you cannot use a `with` block (e.g. middleware that binds at
-    request start and unbinds in a separate teardown hook). Pair every
-    `bind_task_context()` call with `unbind_task_context(token)`.
-    """
-    parent = _task_ctx.get() or {}
-    return _task_ctx.set({**parent, **extra})
+    def __enter__(self) -> dict[str, Any]:
+        if self._token is not None:
+            msg = "task_log_context instance is already active; cannot re-enter"
+            raise RuntimeError(msg)
 
+        # Inheritance: a nested context inherits everything its parent set.
+        # This matches user intent — a sub-task should see the enclosing
+        # request-scoped fields (region, user_id, ...) unless it explicitly
+        # overrides them. Our keys win on collision because dict-merge is
+        # left-to-right.
+        parent = _local_log_attrs.get() or {}
+        merged: dict[str, Any] = {**parent, **self._attrs}
 
-def unbind_task_context(token: contextvars.Token[dict[str, Any] | None]) -> None:
-    """Restore the task context to what it was before `bind_task_context`."""
-    _task_ctx.reset(token)
+        # ContextVar.set returns an opaque token that records EXACTLY what was
+        # there before. reset(token) restores precisely that, even under
+        # nesting and even when the body raises (the finally always runs).
+        # This is the stdlib's blessed pattern for save/restore; rolling our
+        # own would break under reentrancy.
+        self._token = _local_log_attrs.set(merged)
+        return merged
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        if self._token is None:
+            return
+        _local_log_attrs.reset(self._token)
+        self._token = None
+
+    # Explicit aliases for the imperative form. Same machinery, named so the
+    # call site reads naturally without `__dunder__` access.
+    def enter(self) -> dict[str, Any]:
+        """Enter the context (alias for `__enter__`).
+
+        Use when middleware splits enter/exit across separate callbacks and a
+        `with` block won't fit. Otherwise prefer `with task_log_context(...)`.
+        """
+        return self.__enter__()
+
+    def exit(self) -> None:
+        """Exit the context (alias for `__exit__`)."""
+        self.__exit__(None, None, None)
