@@ -1,0 +1,486 @@
+from __future__ import annotations
+
+import io
+import json
+import logging
+import threading
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+import pytest
+
+from task_logging import (
+    JsonFormatter,
+    TaskLogFilter,
+    get_task_log_attrs,
+    log_func_call,
+    task_log_context,
+)
+
+
+def _read_json_lines(buf: io.StringIO) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+
+
+def _install_handler(
+    *,
+    stream: io.StringIO,
+    global_log_attrs: dict[str, Any] | None = None,
+    capture_locals: bool = True,
+    level: int = logging.INFO,
+) -> logging.Handler:
+    """Wire up the canonical pipeline a user would write themselves.
+
+    The library no longer ships `setup_task_logging`; tests build the
+    handler/filter/formatter chain by hand the same way users do. This
+    helper exists only to keep test bodies focused on what they're
+    asserting, not on the wiring boilerplate.
+    """
+    handler = logging.StreamHandler(stream=stream)
+    handler.setFormatter(JsonFormatter(capture_locals=capture_locals))
+    handler.addFilter(TaskLogFilter(global_log_attrs=global_log_attrs))
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(handler)
+    return handler
+
+
+def _reset_root_logger() -> None:
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+        h.close()
+    # Wipe any logger-level filters foreign tests might have left behind.
+    for f in list(root.filters):
+        root.removeFilter(f)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_logging() -> Iterator[None]:
+    _reset_root_logger()
+    yield
+    _reset_root_logger()
+
+
+@pytest.fixture
+def buf() -> io.StringIO:
+    return io.StringIO()
+
+
+def test_handler_writes_json_with_global_attrs(buf: io.StringIO) -> None:
+    _install_handler(
+        stream=buf,
+        global_log_attrs={"service": "OrderService", "env": "prod"},
+    )
+
+    logging.getLogger("biz").info("order created")
+
+    [record] = _read_json_lines(buf)
+    assert record["service"] == "OrderService"
+    assert record["env"] == "prod"
+    assert record["message"] == "order created"
+    assert record["levelname"] == "INFO"
+    assert record["name"] == "biz"
+    # `process` comes from stdlib LogRecord.process, not from us.
+    assert record["process"] > 0
+    assert record["exc_info"] is None
+
+
+def test_no_global_attrs_yields_no_user_attrs(buf: io.StringIO) -> None:
+    """Without global_log_attrs, no user attrs are stamped.
+
+    The library auto-detects nothing. stdlib's own attrs (process, thread,
+    ...) are still there because they're populated by stdlib LogRecord, not
+    by us.
+    """
+    _install_handler(stream=buf)
+    logging.getLogger("biz").info("hi")
+
+    [record] = _read_json_lines(buf)
+    assert record["message"] == "hi"
+    assert record["process"] > 0
+    # User attrs absent (we don't invent any):
+    assert "service" not in record
+    assert "env" not in record
+    assert "hostname" not in record
+    assert "task_id" not in record
+
+
+def test_task_log_context_propagates_attrs(buf: io.StringIO) -> None:
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    log.info("before context")
+    with task_log_context({"task_id": "task-42", "user_id": "u-1"}):
+        log.info("inside context")
+    log.info("after context")
+
+    records = _read_json_lines(buf)
+    assert [r.get("task_id") for r in records] == [None, "task-42", None]
+    assert records[1]["user_id"] == "u-1"
+    assert "user_id" not in records[0]
+    assert "user_id" not in records[2]
+
+
+def test_task_log_context_no_args_is_a_no_op(buf: io.StringIO) -> None:
+    """Empty / missing dict should still work — just no extras stamped."""
+    _install_handler(stream=buf)
+    with task_log_context():
+        logging.getLogger("biz").info("hello")
+
+    [record] = _read_json_lines(buf)
+    assert record["message"] == "hello"
+    assert "task_id" not in record  # the library never invents one
+
+
+def test_task_log_context_nests_and_inner_overrides(buf: io.StringIO) -> None:
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    with task_log_context({"task_id": "outer", "region": "us-west"}):
+        log.info("outer-1")
+        with task_log_context({"task_id": "inner", "note": "nested"}):
+            log.info("inner-1")
+        log.info("outer-2")
+
+    records = _read_json_lines(buf)
+    assert [r["task_id"] for r in records] == ["outer", "inner", "outer"]
+    # Inner inherits region from outer.
+    assert all(r.get("region") == "us-west" for r in records)
+    # `note` is only set inside the inner block.
+    assert records[1]["note"] == "nested"
+    assert "note" not in records[0]
+    assert "note" not in records[2]
+
+
+def test_local_attrs_override_global_attrs(buf: io.StringIO) -> None:
+    """The user-given key in task_log_context wins over global_log_attrs."""
+    _install_handler(stream=buf, global_log_attrs={"region": "us-west"})
+    log = logging.getLogger("biz")
+
+    log.info("global only")
+    with task_log_context({"region": "eu-central"}):
+        log.info("local override")
+
+    records = _read_json_lines(buf)
+    assert records[0]["region"] == "us-west"
+    assert records[1]["region"] == "eu-central"
+
+
+def test_user_can_overwrite_stdlib_record_fields(buf: io.StringIO) -> None:
+    """No protection against clobbering stdlib LogRecord names — by design.
+
+    If a user binds `task_log_context({"name": "X"})`, `record.name` becomes
+    "X". Damage is contained to the per-record copy, and the immediate,
+    visible behaviour is better feedback than silently dropping the key.
+    See filters.py module docstring for the full rationale.
+    """
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    log.info("normal")
+    with task_log_context({"name": "user-override"}):
+        log.info("overridden")
+
+    records = _read_json_lines(buf)
+    assert records[0]["name"] == "biz"
+    assert records[1]["name"] == "user-override"
+
+
+def test_task_log_context_imperative_enter_exit(buf: io.StringIO) -> None:
+    """The same instance can be used via .enter()/.exit() instead of `with`."""
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    ctx = task_log_context({"task_id": "imperative-1"})
+    ctx.enter()
+    try:
+        log.info("inside")
+    finally:
+        ctx.exit()
+    log.info("outside")
+
+    records = _read_json_lines(buf)
+    assert records[0]["task_id"] == "imperative-1"
+    assert "task_id" not in records[1]
+
+
+def test_task_log_context_cannot_be_reentered() -> None:
+    """One instance, one entry. Re-entering is a programming error."""
+    ctx = task_log_context({"task_id": "x"})
+    ctx.enter()
+    try:
+        with pytest.raises(RuntimeError, match="already active"):
+            ctx.enter()
+    finally:
+        ctx.exit()
+
+
+def test_get_task_log_attrs_reads_active_context() -> None:
+    assert get_task_log_attrs() == {}
+    with task_log_context({"task_id": "t-1", "user_id": "u-1"}):
+        attrs = get_task_log_attrs()
+        assert attrs == {"task_id": "t-1", "user_id": "u-1"}
+    assert get_task_log_attrs() == {}
+
+
+def test_third_party_logger_inherits_context(buf: io.StringIO) -> None:
+    """A child logger (mimicking urllib3 / requests) is enriched too."""
+    _install_handler(stream=buf, global_log_attrs={"service": "svc"})
+
+    third_party = logging.getLogger("urllib3.connectionpool")
+    with task_log_context({"task_id": "t-99"}):
+        third_party.warning("Retrying (Retry(total=2))")
+
+    [record] = _read_json_lines(buf)
+    assert record["name"] == "urllib3.connectionpool"
+    assert record["task_id"] == "t-99"
+    assert record["service"] == "svc"
+
+
+def test_filter_does_not_mutate_the_original_record(buf: io.StringIO) -> None:
+    """Enrichment must land on a copy, so other handlers see the unmodified record.
+
+    A host application might install a second handler (Sentry, a debug
+    StreamHandler, ...) on the same logger tree. Our filter must not leak
+    its enriched attributes onto records they're processing.
+    """
+    handler = _install_handler(stream=buf, global_log_attrs={"service": "svc"})
+    log = logging.getLogger("biz")
+
+    # handler.filters is typed loosely (Filter | Callable | _SupportsFilter)
+    # in typeshed; we know we put a TaskLogFilter there ourselves.
+    [ctx_filter] = handler.filters
+    assert isinstance(ctx_filter, TaskLogFilter)
+
+    original = log.makeRecord(
+        name="biz",
+        level=logging.INFO,
+        fn=__file__,
+        lno=1,
+        msg="hi",
+        args=(),
+        exc_info=None,
+    )
+
+    with task_log_context({"task_id": "t-1", "user_id": "u-1"}):
+        enriched = ctx_filter.filter(original)
+
+    assert enriched is not original
+    assert isinstance(enriched, logging.LogRecord)
+
+    # Enriched record carries the context. Read with getattr because
+    # task_id/user_id/service are runtime-stamped attrs not in stdlib's
+    # LogRecord stubs.
+    assert getattr(enriched, "task_id", None) == "t-1"
+    assert getattr(enriched, "user_id", None) == "u-1"
+    assert getattr(enriched, "service", None) == "svc"
+
+    # Original record carries NONE of it — the contract another handler relies on.
+    assert not hasattr(original, "task_id")
+    assert not hasattr(original, "user_id")
+    assert not hasattr(original, "service")
+
+
+def test_exception_is_captured_with_locals(buf: io.StringIO) -> None:
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    def divide(a: int, b: int) -> float:
+        return a / b
+
+    try:
+        divide(1, 0)
+    except ZeroDivisionError:
+        log.exception("division failed")
+
+    [record] = _read_json_lines(buf)
+    exc = record["exc_info"]
+    assert exc is not None
+    assert exc["name"] == "ZeroDivisionError"
+    assert exc["details"] == "division by zero"
+    assert "Traceback" in exc["stack_trace"]
+    # Locals captured at the deepest frame (inside `divide`).
+    assert exc["locals_dict"] == {"a": "1", "b": "0"}
+
+
+def test_capture_locals_can_be_disabled(buf: io.StringIO) -> None:
+    _install_handler(stream=buf, capture_locals=False)
+    log = logging.getLogger("biz")
+    try:
+        raise RuntimeError("boom")
+    except RuntimeError:
+        log.exception("oops")
+
+    [record] = _read_json_lines(buf)
+    assert record["exc_info"]["locals_dict"] == {}
+
+
+def test_filter_attached_to_logger_misses_third_party_records(
+    buf: io.StringIO,
+) -> None:
+    """Anti-canary documenting why TaskLogFilter must go on a HANDLER.
+
+    If you attach TaskLogFilter to a logger (instead of a handler), records
+    propagating up from child loggers do NOT pass through it — that's a
+    stdlib quirk, not our bug. This test pins the failure mode in place,
+    so future contributors can see what would break if someone "helps" by
+    moving the filter to the root logger.
+    """
+    # Plain handler with NO filter; filter goes on the logger instead.
+    handler = logging.StreamHandler(stream=buf)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    root.addFilter(TaskLogFilter(global_log_attrs={"service": "svc"}))
+
+    # A child logger emits a record. It propagates up but bypasses the
+    # logger-level filter (stdlib calls logger.filter only for records
+    # emitted DIRECTLY on that logger).
+    child = logging.getLogger("urllib3.connectionpool")
+    with task_log_context({"task_id": "t-1"}):
+        child.warning("hi")
+
+    [record] = _read_json_lines(buf)
+    # No service or task_id — the filter never ran for this record.
+    assert "service" not in record
+    assert "task_id" not in record
+
+
+def test_log_func_call_emits_enter_and_exit(buf: io.StringIO) -> None:
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    @log_func_call(log)
+    def add(x: int, y: int) -> int:
+        return x + y
+
+    assert add(2, 3) == 5
+
+    msgs = [r["message"] for r in _read_json_lines(buf)]
+    assert msgs[0].startswith("ENTER")
+    assert "add" in msgs[0]
+    assert msgs[1].startswith("EXIT")
+    assert "return=5" in msgs[1]
+
+
+def test_log_func_call_logs_exception_and_reraises(buf: io.StringIO) -> None:
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    @log_func_call(log)
+    def boom() -> None:
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        boom()
+
+    records = _read_json_lines(buf)
+    assert any(
+        r["message"].startswith("ENTER") and "boom" in r["message"] for r in records
+    )
+    raise_records = [
+        r
+        for r in records
+        if r["message"].startswith("RAISE") and "boom" in r["message"]
+    ]
+    assert len(raise_records) == 1
+    assert raise_records[0]["exc_info"]["name"] == "ValueError"
+
+
+def test_log_func_call_decorates_a_method_without_any_class_setup(
+    buf: io.StringIO,
+) -> None:
+    """Method use case: no `self._logger`, no extra plumbing required."""
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz.service")
+
+    class Service:
+        @log_func_call(log)
+        def handle(self, n: int) -> int:
+            return n * 2
+
+    assert Service().handle(7) == 14
+
+    records = _read_json_lines(buf)
+    assert records[0]["name"] == "biz.service"
+    # qualname includes the class, so we can tell methods from functions in logs.
+    assert "Service.handle" in records[0]["message"]
+    assert "return=14" in records[1]["message"]
+
+
+def test_log_func_call_auto_resolves_logger_from_module(buf: io.StringIO) -> None:
+    """When `logger` is omitted, fall back to logging.getLogger(func.__module__)."""
+    _install_handler(stream=buf)
+
+    @log_func_call()
+    def compute() -> int:
+        return 42
+
+    assert compute() == 42
+
+    records = _read_json_lines(buf)
+    assert records[0]["name"] == compute.__module__
+    assert records[0]["name"] == __name__
+
+
+def test_log_func_call_respects_custom_level(buf: io.StringIO) -> None:
+    _install_handler(stream=buf, level=logging.DEBUG)
+    log = logging.getLogger("biz")
+
+    @log_func_call(log, level=logging.DEBUG)
+    def step() -> str:
+        return "ok"
+
+    step()
+    records = _read_json_lines(buf)
+    assert all(r["levelname"] == "DEBUG" for r in records)
+
+
+def test_context_isolated_across_threads(buf: io.StringIO) -> None:
+    _install_handler(stream=buf)
+    log = logging.getLogger("biz")
+
+    barrier = threading.Barrier(2)
+
+    def worker(tid: str) -> None:
+        with task_log_context({"task_id": tid}):
+            barrier.wait()
+            log.info(f"hello from {tid}")
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        list(ex.map(worker, ["t-A", "t-B"]))
+
+    task_ids = {r["task_id"] for r in _read_json_lines(buf)}
+    assert task_ids == {"t-A", "t-B"}
+
+
+def test_filter_and_formatter_can_attach_to_a_non_root_logger(
+    buf: io.StringIO,
+) -> None:
+    """Sanity: the primitives don't assume root. Demonstrates the kind of
+    flexibility manual wiring enables — attach the JSON pipeline to a
+    specific sub-logger only, with propagation disabled, so the rest of
+    the tree is unaffected.
+    """
+    handler = logging.StreamHandler(stream=buf)
+    handler.setFormatter(JsonFormatter())
+    handler.addFilter(TaskLogFilter(global_log_attrs={"service": "isolated"}))
+
+    biz = logging.getLogger("biz")
+    biz.addHandler(handler)
+    biz.setLevel(logging.INFO)
+    biz.propagate = False  # don't reach the (absent) root handlers
+
+    biz.info("from biz")
+    logging.getLogger("other").info("from other")
+
+    records = _read_json_lines(buf)
+    # Only the biz log made it through; "other" went up to the (handlerless)
+    # root and disappeared.
+    assert len(records) == 1
+    assert records[0]["name"] == "biz"
+    assert records[0]["service"] == "isolated"

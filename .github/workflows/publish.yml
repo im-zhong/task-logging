@@ -25,6 +25,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Install Python
+        # Build/publish on the lowest supported version; this is a pure-Python
+        # wheel so the resulting artifact runs unchanged on 3.12 – 3.14.
         run: uv python install 3.12
 
       - name: Sync dependencies
@@ -37,7 +39,7 @@ jobs:
         run: uv run mypy .
 
       - name: Pytest
-        run: uv run pytest --cov=task_logging --cov-report=term-missing\
+        run: uv run pytest --cov=task_logging --cov-report=term-missing
 
       - name: Build package
         run: uv build
