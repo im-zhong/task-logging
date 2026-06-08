@@ -111,13 +111,7 @@ class TaskLogFilter(logging.Filter):
             dict(global_log_attrs) if global_log_attrs else {}
         )
 
-    def filter(self, record: logging.LogRecord) -> logging.LogRecord:  # type: ignore[override]
-        # The override-ignore is a typeshed gap, not a runtime concern.
-        # Stdlib widened `Filter.filter`'s return type to `bool | LogRecord`
-        # in Python 3.12, but typeshed's stubs still declare it as `bool`.
-        # The runtime behaviour is exactly what we want; only the type
-        # checker disagrees.
-        #
+    def filter(self, record: logging.LogRecord) -> logging.LogRecord:
         # Shallow-copy is enough: LogRecord's interesting state is its
         # __dict__, which copy.copy duplicates. The expensive bits — exc_info
         # tuples, stack frames — are immutable from our perspective and

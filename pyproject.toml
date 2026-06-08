@@ -4,13 +4,11 @@ version = "0.0.1"
 description = ""
 authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.12,<4.0"
 dependencies = []
 
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -41,9 +39,9 @@ build-backend = "hatchling.build"
 [tool.ruff]
 fix = true
 # Pin lint target to the lowest supported runtime so version-aware rules
-# (UP, FA, PYI, …) judge the code against 3.10's syntax/library surface
+# (UP, FA, PYI, …) judge the code against 3.12's syntax/library surface
 # rather than the developer's local interpreter.
-target-version = "py310"
+target-version = "py312"
 
 
 [tool.ruff.lint]
@@ -82,7 +80,7 @@ ignore = [
 strict = true
 # Type-check against the lowest supported version so we can't accidentally
 # rely on stdlib stubs or typing constructs only present on newer runtimes.
-python_version = "3.10"
+python_version = "3.12"
 
 
 # https://docs.astral.sh/uv/guides/package/
