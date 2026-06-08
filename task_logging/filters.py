@@ -12,8 +12,7 @@ Why a Filter (not a custom Logger subclass, not setLogRecordFactory):
 
     setLogRecordFactory works too but is a process-global mutation that's
     hard to reverse and tests can't isolate cleanly. A handler-level filter
-    is local and reversible (setup_task_logging() can replace its own
-    handlers).
+    is local and reversible — `root.removeHandler(h)` undoes it.
 
 Why we COPY the record instead of mutating it:
     The cookbook's "Imparting contextual information in handlers" pattern.

@@ -171,9 +171,10 @@ To be honest about the tradeoffs:
 
 ## Why one format, not two
 
-Earlier versions of `setup_task_logging` shipped a second "human-readable"
-formatter that engaged automatically when stdout was a TTY. We removed
-it. The reasons:
+Earlier versions of the library shipped a `setup_task_logging` wrapper
+(itself since removed; see the README) that included a second
+"human-readable" formatter, engaged automatically when stdout was a
+TTY. We removed both. The reasons:
 
 1. **Two code paths, two test surfaces.** Every fix to the JSON formatter
    had to be checked against the human one, and vice versa. Bugs leaked

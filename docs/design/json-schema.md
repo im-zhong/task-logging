@@ -25,7 +25,7 @@ LogRecord (built by stdlib logging, ~25 attrs on record.__dict__)
     │
     ▼
 TaskLogFilter  →  stamps onto record.__dict__:
-    │                   global_log_attrs (from setup_task_logging)
+    │                   global_log_attrs (from TaskLogFilter(...))
     │                 + every key from the active task_log_context
     ▼
 JsonFormatter      →  emits record.__dict__ verbatim,
@@ -81,7 +81,7 @@ under a second name would contradict "JSON keys mirror LogRecord."
 
 ## Group 3: user-supplied attrs
 
-Anything in `setup_task_logging(global_log_attrs={...})` or
+Anything in `TaskLogFilter(global_log_attrs={...})` or
 `task_log_context({...})` rides through to the JSON. The library does
 not name any field — `service`, `env`, `task_id`, `user_id`,
 `request_id`, `region`, `hostname` are all conventions you pick, not
@@ -89,7 +89,7 @@ names the library bakes in.
 
 | JSON key | Source |
 |---|---|
-| `service`, `env`, `region`, `hostname`, ... | Process-wide via `setup_task_logging(global_log_attrs={...})` (typically picked at app startup). |
+| `service`, `env`, `region`, `hostname`, ... | Process-wide via `TaskLogFilter(global_log_attrs={...})` (typically picked at app startup). |
 | `task_id`, `request_id`, `user_id`, ... | Per-context via `task_log_context({...})` (typically picked per request). |
 
 Inner `task_log_context` overrides outer, and `task_log_context` overrides

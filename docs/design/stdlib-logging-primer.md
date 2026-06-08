@@ -143,15 +143,16 @@ all. It uses **effective level**: walk up the tree until you find a
 logger with a level set; that's your threshold.
 
 ```
-root.level         = WARNING   ← set by setup_task_logging
+root.level         = WARNING   ← set at startup by user code
 "myapp".level      = NOTSET    (inherit)
 "myapp.db".level   = DEBUG     ← explicitly set
 "myapp.db.pool"    = NOTSET    (inherit "myapp.db" → DEBUG)
 ```
 
-So `myapp.db.pool` effectively logs at DEBUG. This is the mechanism
-behind `setup_task_logging(quiet_loggers={"urllib3": logging.WARNING})`: we
-set the level on the `urllib3` logger so all of `urllib3.connectionpool`,
+So `myapp.db.pool` effectively logs at DEBUG. This is also the
+mechanism behind the standard 'silence a chatty library' recipe:
+`logging.getLogger("urllib3").setLevel(logging.WARNING)` sets the level
+on the `urllib3` logger so all of `urllib3.connectionpool`,
 `urllib3.util`, etc. inherit it.
 
 ### Propagation — the part that confuses everyone
@@ -308,29 +309,31 @@ Two methods worth knowing:
 - `formatter.formatTime(record, datefmt)` — formats `record.created` as a
   timestamp
 
-## Putting it together: what `setup_task_logging` actually does
+## Putting it together: what the user's six-line setup actually does
 
 Now you can read the whole flow without surprise:
 
 ```python
-def setup_task_logging(*, global_log_attrs=None, level=INFO, ...):
-    root = logging.getLogger()                # the tree's root
-    root.setLevel(level)                      # global threshold
+import logging, sys
+from task_logging import JsonFormatter, TaskLogFilter
 
-    ctx_filter = TaskLogFilter(global_log_attrs=global_log_attrs)
-    formatter  = JsonFormatter()
+handler = logging.StreamHandler(sys.stdout)   # one handler, stdout
+handler.setFormatter(JsonFormatter())         # how to render
+handler.addFilter(TaskLogFilter(              # what to enrich
+    global_log_attrs={"service": "X"}
+))
+root = logging.getLogger()                    # the tree's root
+root.addHandler(handler)                      # attach to ROOT
+root.setLevel(logging.INFO)                   # global threshold
 
-    handler = StreamHandler(sys.stdout)       # one handler, stdout
-    handler.setFormatter(formatter)           # how to render
-    handler.addFilter(ctx_filter)             # what to enrich
-    root.addHandler(handler)                  # attach to ROOT
+logging.getLogger("urllib3").setLevel(logging.WARNING)  # silence chatty libs
 ```
 
 When `urllib3.connectionpool` later does `log.warning("retrying")`:
 
 1. The `urllib3.connectionpool` logger creates a `LogRecord`.
 2. Effective level check: `urllib3.connectionpool` has no level →
-   `urllib3` has WARNING (set via `quiet_loggers`) → passes.
+   `urllib3` has WARNING (set via `setLevel`) → passes.
 3. `callHandlers` walks up the tree: `urllib3.connectionpool` (no
    handlers) → `urllib3` (no handlers) → root (has our stdout handler).
 4. The handler:

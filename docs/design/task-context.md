@@ -147,9 +147,10 @@ class TaskLogFilter(logging.Filter):
         return record                            # ← LogRecord, not bool
 ```
 
-`setup_task_logging` attaches this filter to the stdout handler. So every
-record emitted by **any** logger in the process — your code, `urllib3`,
-`boto3`, anything — passes through this filter on its way out, and gets
+A user attaches this filter to a stdout handler (see the README's
+quick-start for the six-line wiring). So every record emitted by
+**any** logger in the process — your code, `urllib3`, `boto3`,
+anything — passes through this filter on its way out, and gets
 every key from `global_log_attrs` and the active `task_log_context`
 attrs, set as attributes on a fresh copy.
 
@@ -267,7 +268,7 @@ Three things conspire:
    `urllib3.connectionpool` is a child of `urllib3` is a child of root.
    When `urllib3.connectionpool` emits a record, the record propagates up
    the tree until it hits a handler. By default, only the root has a
-   handler — the one we installed in `setup_task_logging`.
+   handler — the one the user installed at startup (see README quick-start).
 
 2. **The filter is on the handler, not on individual loggers.** So every
    record that reaches the root handler — regardless of which logger
@@ -290,16 +291,23 @@ mechanisms used as designed.
 Here's what happens when you write:
 
 ```python
-setup_task_logging(global_log_attrs={"service": "OrderService"})
+import logging, sys
+from task_logging import JsonFormatter, TaskLogFilter, task_log_context
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+handler.addFilter(TaskLogFilter(global_log_attrs={"service": "OrderService"}))
+logging.getLogger().addHandler(handler)
+
 log = logging.getLogger("biz")
 
 with task_log_context({"task_id": "task-42", "user_id": "u-1"}):
     log.info("hello")
 ```
 
-1. `setup_task_logging` creates a `StreamHandler(sys.stdout)`, attaches a
-   `TaskLogFilter(global_log_attrs={"service": "OrderService"})` and a
-   `JsonFormatter`, and adds the handler to the **root** logger.
+1. The user's setup code creates a `StreamHandler(sys.stdout)`, attaches
+   a `TaskLogFilter(global_log_attrs={"service": "OrderService"})` and
+   a `JsonFormatter`, and adds the handler to the **root** logger.
 
 2. Entering `task_log_context({"task_id": "task-42", "user_id": "u-1"})`
    merges `{"task_id": "task-42", "user_id": "u-1"}` with any enclosing
@@ -339,7 +347,7 @@ with task_log_context({"task_id": "task-42", "user_id": "u-1"}):
 | **Thread-local storage** (`threading.local`) | Doesn't work with `asyncio` — all coroutines on one event loop share a thread, so they'd share the same `task_id`. ContextVars work for both. |
 | **`logging.LoggerAdapter`** | Forces every log site to use a special logger object. Doesn't capture third-party libraries that call `logging.getLogger("urllib3")` themselves. |
 | **`extra={"task_id": ...}` on every call** | Same problem: every log site has to know to do it. Defeats the entire point of having implicit context. |
-| **`logging.setLogRecordFactory`** | Works, but is a process-global mutation that's hard to reverse and tests can't isolate cleanly. A per-handler filter is local and reversible (and `setup_task_logging` can replace its own handlers idempotently). |
+| **`logging.setLogRecordFactory`** | Works, but is a process-global mutation that's hard to reverse and tests can't isolate cleanly. A per-handler filter is local and reversible (`root.removeHandler(h)` undoes it). |
 | **Make `task_id` a Loki label** | Would crash Loki — Loki indexes by label combinations, and one stream per task is high-cardinality hell. `task_id` rides inside the JSON; Alloy promotes it to "structured metadata" so it stays queryable but unindexed. See [why-json-logs.md](why-json-logs.md). |
 
 ## TL;DR

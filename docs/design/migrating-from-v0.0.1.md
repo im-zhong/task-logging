@@ -19,21 +19,22 @@ isn't just an opaque rewrite).
 
 | Old: bound to `TaskLogger` instance | New: where it lives |
 |---|---|
-| `service_name` | `setup_task_logging(global_log_attrs={"service": ...})` — process-wide, set once at startup |
+| `service_name` | `TaskLogFilter(global_log_attrs={"service": ...})` — process-wide, set once at startup |
 | `task_id` | `task_log_context({"task_id": ...})` — per-request, flows via `contextvars` |
 | every other field (exc_info, frame info, …) | `TaskLogFilter` + stdlib's auto-populated `LogRecord` attributes |
 | `hostname` | now user-supplied: pass `socket.gethostname()` in `global_log_attrs` if you want it. The deployment platform usually adds a better identifier (Kubernetes pod name, Docker container label) anyway. |
 
 The combination — not any single one of them — replaces what
 `TaskLogger` did. `task_log_context` alone is **not** a drop-in for
-`TaskLogger`; you also need `setup_task_logging` running and the filter
-attached.
+`TaskLogger`; you also need a stdlib handler with `TaskLogFilter` and
+`JsonFormatter` attached (see README quick-start for the six-line
+recipe).
 
 ## Capability-by-capability mapping
 
 | Old `TaskLogger` did | Now done by | Notes |
 |---|---|---|
-| Bind `service_name` to the logger | `TaskLogFilter` (set at `setup_task_logging` time) | `service` is process-wide; it belongs to one-time setup, not per-call. |
+| Bind `service_name` to the logger | `TaskLogFilter(global_log_attrs={"service": ...})` | `service` is process-wide; pass it to the filter at handler-construction time. |
 | Bind `task_id` to the logger | `contextvars` + `task_log_context()` | `task_id` is per-request and now flows through threads / asyncio tasks automatically. See [task-context.md](task-context.md). |
 | Capture `hostname` | now user-supplied | Pass `socket.gethostname()` in `global_log_attrs` to keep the old behaviour. The library no longer auto-detects this — see "Why we don't auto-detect anything" in `task_logging/filters.py`. |
 | Capture `process_id` | stdlib auto-populates `record.process` | We don't even have to set it. |
@@ -130,15 +131,19 @@ the same expensive `inspect.stack()` call we just got rid of.
 If you do want it back, a one-line filter recovers it:
 
 ```python
-import inspect, logging
+import inspect, logging, sys
+from task_logging import JsonFormatter, TaskLogFilter
 
 class StackDepthFilter(logging.Filter):
     def filter(self, record):
         record.stack_depth = len(inspect.stack())
         return True
 
-setup_task_logging()
-logging.getLogger().handlers[0].addFilter(StackDepthFilter())
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+handler.addFilter(TaskLogFilter())
+handler.addFilter(StackDepthFilter())
+logging.getLogger().addHandler(handler)
 ```
 
 The field will then ride through `JsonFormatter` automatically (it's
@@ -160,9 +165,16 @@ def handle_request(req):
 
 ```python
 # After
-setup_task_logging(
+import logging, sys
+from task_logging import JsonFormatter, TaskLogFilter, task_log_context
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+handler.addFilter(TaskLogFilter(
     global_log_attrs={"service": "OrderService", "env": "prod"},
-)
+))
+logging.getLogger().addHandler(handler)
+logging.getLogger().setLevel(logging.INFO)
 
 log = logging.getLogger(__name__)
 
@@ -174,8 +186,8 @@ def handle_request(req):
 
 Three differences worth pointing out:
 
-1. **Setup is global, not per-task.** `setup_task_logging` runs once at
-   process startup. There's no factory, no per-task logger instance.
+1. **Setup is global, not per-task.** Wire it up once at process
+   startup. There's no factory, no per-task logger instance.
 2. **Use module loggers, not service loggers.** Replace
    `factory.new(service_name=...)` with the stdlib idiom
    `logging.getLogger(__name__)`. The `service` field is still on every
