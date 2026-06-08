@@ -1,7 +1,7 @@
 [project]
 name = "task-logging"
-version = "0.0.1"
-description = ""
+version = "0.1.0"
+description = "Task-aware structured logging for distributed Python services."
 authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
 requires-python = ">=3.12,<4.0"
@@ -71,7 +71,15 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # Tests are allowed to use raw literals, raise inline, and skip return annotations.
-"tests/*" = ["ANN201", "ANN202", "EM101", "EM102", "PLR2004", "TRY301", "INP001"]
+"tests/*" = [
+    "ANN201",
+    "ANN202",
+    "EM101",
+    "EM102",
+    "PLR2004",
+    "TRY301",
+    "INP001",
+]
 # `_render_exc_info` mirrors stdlib's `logging.Formatter` signature, which uses bool|tuple.
 "task_logging/formatters.py" = ["FBT001"]
 
