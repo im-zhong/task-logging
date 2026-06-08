@@ -47,58 +47,39 @@ import traceback
 from types import TracebackType
 from typing import Any
 
-# https://docs.python.org/3/library/logging.html#logrecord-attributes
-# LogRecord attributes that are bookkeeping / already encoded elsewhere — we
-# do NOT spill them into the JSON payload as "extras".
-_BUILTIN_LOGRECORD_ATTRS: frozenset[str] = frozenset(
+# Stdlib LogRecord attributes we deliberately exclude from the JSON output.
+# Everything else on record.__dict__ — including stdlib's own fields and any
+# extras stamped on by filters / `extra=` / task_context — is emitted as-is.
+#
+# Reasons each is dropped (see docs/design/json-schema.md "Group 5"):
+#   args / msg            -- already substituted into `message`
+#   msecs / relativeCreated / asctime
+#                         -- redundant with the float `created`
+#   levelno               -- redundant with `levelname`
+#   exc_info              -- handled specially: the raw tuple is replaced
+#                            with our rendered {name, details, stack_trace,
+#                            locals_dict} object under the same key
+#   exc_text / stack_info -- already encoded inside `exc_info.stack_trace`
+#   processName           -- almost always "MainProcess", noise
+#   filename              -- redundant with `pathname` (basename only)
+#   taskName              -- asyncio task name, conflicts semantically with
+#                            our `task_id`
+#
+# Reference: https://docs.python.org/3/library/logging.html#logrecord-attributes
+_DROPPED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
     {
         "args",
         "asctime",
-        "created",
-        "exc_info",
+        "exc_info",  # rewritten under the same key with our structured shape
         "exc_text",
         "filename",
-        "funcName",
-        "levelname",
         "levelno",
-        "lineno",
-        "message",
-        "module",
         "msecs",
         "msg",
-        "name",
-        "pathname",
-        "process",
         "processName",
         "relativeCreated",
         "stack_info",
-        "thread",
-        "threadName",
-        "taskName",  # added in Python 3.12
-    }
-)
-
-# Top-level fields the formatter writes itself.
-_FORMATTER_OWN_KEYS: frozenset[str] = frozenset(
-    {
-        # mirrored from stdlib LogRecord
-        "created",
-        "levelname",
-        "name",
-        "message",
-        "process",
-        "thread",
-        "threadName",
-        "module",
-        "funcName",
-        "pathname",
-        "lineno",
-        "exc_info",
-        # added by us (no stdlib equivalent)
-        "service",
-        "env",
-        "hostname",
-        "task_id",
+        "taskName",  # Python 3.12+
     }
 )
 
@@ -106,34 +87,43 @@ _FORMATTER_OWN_KEYS: frozenset[str] = frozenset(
 class JsonFormatter(logging.Formatter):
     """Render a LogRecord as one line of JSON.
 
-    Output schema (keys are stable; consumers may rely on them).
+    The formatter emits **every attribute on `record.__dict__`** — stdlib's
+    built-in fields, anything stamped on by filters (service, env, hostname,
+    task_id), and any user fields bound via `task_context(**extra)` — minus
+    a small drop-list of redundant / internal attributes
+    (`_DROPPED_LOGRECORD_ATTRS`). Two values are computed specially:
 
-    Mirrored from stdlib LogRecord — names match the official attribute
-    table at https://docs.python.org/3/library/logging.html#logrecord-attributes ::
+      - `message`  – `record.getMessage()` (lazy %-formatting)
+      - `exc_info` – `record.exc_info` rendered into a structured object
+                     (name / details / stack_trace / locals_dict)
+
+    JSON keys mirror stdlib LogRecord attribute names exactly. The official
+    attribute reference is also our schema reference:
+    https://docs.python.org/3/library/logging.html#logrecord-attributes
+
+    A typical record looks like::
 
         {
-          "created":    1717839622.503112,    # Unix timestamp (float)
-          "levelname":  "INFO" | "ERROR" | ...,
-          "name":       record.name,           # the logger name
-          "message":    the formatted message  (record.getMessage())
-          "process":    record.process,        # PID
-          "thread":     record.thread,         # thread id
-          "threadName": record.threadName,
-          "module":     record.module,
-          "funcName":   record.funcName,
-          "pathname":   record.pathname,
-          "lineno":     record.lineno,
-          "exc_info":   {name, details, stack_trace, locals_dict} | null,
-
-          # added by us (no stdlib equivalent on LogRecord)
-          "service":    set by TaskContextFilter,
-          "env":        set by TaskContextFilter (may be null),
-          "hostname":   machine hostname,
-          "task_id":    current task id (may be null),
-          ...:          any extra fields you bound via task_context(**extra)
+          "created":    1717839622.503112,
+          "levelname":  "INFO",
+          "name":       "billing.settlement",
+          "message":    "charging account",
+          "process":    4321,
+          "thread":     140234567890,
+          "threadName": "MainThread",
+          "module":     "settlement",
+          "funcName":   "charge",
+          "pathname":   "/app/billing/settlement.py",
+          "lineno":     87,
+          "exc_info":   null,
+          "service":    "Billing",         // added by TaskContextFilter
+          "env":        "prod",
+          "hostname":   "worker-7",
+          "task_id":    "task-42",
+          "user_id":    "u-1"              // user extra via task_context
         }
 
-    For the rationale behind each key name — what was kept, what was dropped,
+    For the rationale behind each key name — what is kept, what is dropped,
     and the stability promise — see docs/design/json-schema.md.
     """
 
@@ -142,52 +132,43 @@ class JsonFormatter(logging.Formatter):
         self._capture_locals = capture_locals
 
     def format(self, record: logging.LogRecord) -> str:
-        # Top-level keys are kept STABLE — Alloy's stage.json config in the
-        # README references them by name. Renaming a key here is a breaking
-        # change for every Alloy config in the wild. Add new keys freely;
-        # don't rename or remove existing ones without a major bump.
+        # We emit EVERYTHING on record.__dict__ except a small drop-list,
+        # rather than enumerating each key by hand. Reasons:
+        #   - record.__dict__ already holds stdlib's own attributes AND any
+        #     fields stamped on by filters / `extra=` / task_context, all
+        #     in one place. One loop, no duplication, no "did I forget to
+        #     add the new field to the dict?" maintenance burden.
+        #   - Adding a stdlib attribute we already wanted (or accepting a
+        #     new field a user binds via task_context) is automatic — no
+        #     code change needed.
+        #   - The few stdlib attrs we DO want to suppress (raw msg/args,
+        #     redundant timestamps, internal exc_text, ...) are listed once,
+        #     positively, in _DROPPED_LOGRECORD_ATTRS above.
+        #
+        # Stability note: top-level keys are public API. Alloy's stage.json
+        # in the README references them by name. Renaming a key here is a
+        # breaking change for every Alloy config in the wild. Add freely;
+        # don't rename/remove without a major bump.
         payload: dict[str, Any] = {
-            # `created` is the raw Unix timestamp (matches LogRecord.created),
-            # used by Alloy as the canonical timestamp via
-            # `stage.timestamp { format = "Unix" }` — far more accurate than
-            # "the time Alloy happened to read the line."
-            "created": record.created,
-            "levelname": record.levelname,
-            "name": record.name,
-            "message": record.getMessage(),
-            "process": record.process,
-            "thread": record.thread,
-            "threadName": record.threadName,
-            "module": record.module,
-            "funcName": record.funcName,
-            "pathname": record.pathname,
-            "lineno": record.lineno,
-            # added by us via TaskContextFilter — no stdlib equivalent
-            "service": getattr(record, "service", None),
-            "env": getattr(record, "env", None),
-            "hostname": getattr(record, "hostname", None),
-            "task_id": getattr(record, "task_id", None),
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in _DROPPED_LOGRECORD_ATTRS and not key.startswith("_")
         }
 
-        # Exception info, if any. Either set via logger.exception() /
-        # exc_info=True or because the record was emitted from inside an
-        # except block. We render the raw exc_info tuple into a structured
-        # object and write it under the same key stdlib uses on the record
-        # (`exc_info`), so the JSON name matches the LogRecord name.
-        if record.exc_info:
-            payload["exc_info"] = self._render_exc_info(record.exc_info)
-        else:
-            payload["exc_info"] = None
+        # `message` is computed lazily on the LogRecord (via getMessage()) —
+        # it's not in record.__dict__ until something calls Formatter.format,
+        # so the comprehension above misses it. Stdlib's own Formatter calls
+        # record.getMessage() here too.
+        payload["message"] = record.getMessage()
 
-        # Anything extra that filters / `extra=` / task_context bound onto the
-        # record gets merged in at the top level. Keys collisions: payload wins
-        # for our own keys; the user's extras win otherwise.
-        for key, value in record.__dict__.items():
-            if key in _BUILTIN_LOGRECORD_ATTRS or key in _FORMATTER_OWN_KEYS:
-                continue
-            if key.startswith("_"):
-                continue
-            payload[key] = value
+        # `exc_info` on the record is a raw (type, value, tb) tuple, which
+        # isn't JSON-serialisable and isn't useful as-is. Replace it with our
+        # rendered {name, details, stack_trace, locals_dict} object — under
+        # the SAME key, so the JSON name still matches the LogRecord name.
+        # We dropped the raw tuple via _DROPPED_LOGRECORD_ATTRS above.
+        payload["exc_info"] = (
+            self._render_exc_info(record.exc_info) if record.exc_info else None
+        )
 
         return json.dumps(payload, default=_json_default, ensure_ascii=False)
 

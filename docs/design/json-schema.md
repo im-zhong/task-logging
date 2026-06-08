@@ -22,17 +22,27 @@ and the stability promise.
 There are three "sources" feeding the JSON payload:
 
 ```
-LogRecord (built by stdlib logging, ~25 attrs)
+LogRecord (built by stdlib logging, ~25 attrs on record.__dict__)
     │
     ▼
-TaskContextFilter  →  adds: service, env, hostname, task_id,
-    │                       *task_context extras*
+TaskContextFilter  →  stamps onto record.__dict__:
+    │                   service, env, hostname, task_id,
+    │                   + every key from task_context(**extra)
     ▼
-JsonFormatter      →  picks which to keep, drops the redundant ones,
-    │                 keeps stdlib names verbatim
+JsonFormatter      →  emits record.__dict__ verbatim,
+    │                 minus a small drop-list (_DROPPED_LOGRECORD_ATTRS),
+    │                 plus a computed `message` and rendered `exc_info`
     ▼
 JSON payload {created, levelname, name, message, ...}
 ```
+
+The formatter is a **negative filter, not a positive enumeration**:
+everything on `record.__dict__` is emitted unless explicitly dropped.
+That's the answer to "do we have to list every attribute we want?" — no,
+we list the few we *don't* want. Adding a new field anywhere upstream
+(stdlib gaining a new attribute, a filter stamping a new key, a user
+binding a new one via `task_context`) shows up in the JSON
+automatically.
 
 Every key in the JSON falls into one of four groups below.
 
@@ -86,14 +96,17 @@ under a second name would contradict "JSON keys mirror LogRecord."
 
 | JSON key | Source |
 |---|---|
-| `user_id`, `request_id`, `region`, … | Whatever you passed to `task_context(**extra)` or `static_fields=` in `setup_logging`. The formatter walks `record.__dict__` and emits anything that isn't a built-in `LogRecord` attribute. |
+| `user_id`, `request_id`, `region`, … | Whatever you passed to `task_context(**extra)` or `static_fields=` in `setup_logging`. The formatter walks `record.__dict__` and emits anything that isn't on the drop-list (Group 5). |
 
 These are user-defined; we don't control their casing.
 
-## Group 5: stdlib attributes deliberately *dropped*
+## Group 5: `_DROPPED_LOGRECORD_ATTRS` — the negative filter
 
-Worth being explicit about what's NOT in the payload, because we curated
-which stdlib fields to keep:
+This is the actual implementation primitive: the formatter emits every
+attribute on `record.__dict__` *except* the names in this set. Listing
+the few we want to suppress (rather than the many we want to keep) is
+much shorter and means new stdlib attributes / new context keys are
+emitted automatically without code changes.
 
 | Dropped | Why |
 |---|---|
