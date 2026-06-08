@@ -84,6 +84,32 @@ def log_call(
         # the module the function lives in.
         bound_logger = logger or logging.getLogger(func.__module__)
 
+        # @functools.wraps(func) makes `wrapper` IMPERSONATE `func` for
+        # introspection. Without it, `wrapper` is a brand-new function object
+        # and every tool that asks "what is this callable?" gets `wrapper`'s
+        # answers instead of `func`'s:
+        #
+        #   - tracebacks blame "wrapper" instead of the real function name
+        #   - record.funcName (the LogRecord attr stdlib auto-populates from
+        #     the call site) becomes "wrapper" for every decorated function
+        #     in the codebase
+        #   - help(decorated_fn), pydoc, Sphinx, IDE hover — all show the
+        #     wrapper's empty docstring instead of the real one
+        #   - inspect.signature(decorated_fn) sees `(*args, **kwargs)` instead
+        #     of the real (x: int, y: int) -> int signature
+        #   - serialization tools that look up callables by __qualname__ break
+        #
+        # `functools.wraps` is sugar for functools.update_wrapper, which
+        # copies __module__, __name__, __qualname__, __annotations__, __doc__,
+        # and updates __dict__ from func onto wrapper, plus sets
+        # wrapper.__wrapped__ = func so inspect.signature() can see through
+        # the wrapper transparently.
+        #
+        # This decorator REFERENCES func.__qualname__ in its log messages
+        # explicitly, so the messages themselves don't depend on @wraps —
+        # but record.funcName, traceback frames, and every other consumer
+        # of the wrapper's identity DO depend on it. Don't remove this line
+        # "to clean up imports."
         @functools.wraps(func)
         def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             # __qualname__ (not __name__) so methods show up as
