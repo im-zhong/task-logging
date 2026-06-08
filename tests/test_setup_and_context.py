@@ -57,19 +57,28 @@ def test_setup_task_logging_writes_json_with_global_attrs(buf: io.StringIO) -> N
     assert record["name"] == "biz"
     # `process` comes from stdlib LogRecord.process, not from us.
     assert record["process"] > 0
-    assert record["hostname"]
     assert record["exc_info"] is None
 
 
-def test_no_global_attrs_yields_only_auto_detected(buf: io.StringIO) -> None:
-    """global_log_attrs is optional; without it, only hostname is auto-stamped."""
+def test_no_global_attrs_yields_no_user_attrs(buf: io.StringIO) -> None:
+    """global_log_attrs is optional; without it, no user attrs are stamped.
+
+    The library auto-detects nothing — service, env, hostname, task_id all
+    have to come from the user. stdlib's own attrs (process, thread, ...)
+    are still there because they're populated by stdlib LogRecord, not by us.
+    """
     setup_task_logging(stream=buf)
     logging.getLogger("biz").info("hi")
 
     [record] = _read_json_lines(buf)
-    assert record["hostname"]
-    assert "service" not in record  # we don't invent it
+    assert record["message"] == "hi"
+    # stdlib LogRecord attrs present:
+    assert record["process"] > 0
+    # User attrs absent (we don't invent any):
+    assert "service" not in record
     assert "env" not in record
+    assert "hostname" not in record
+    assert "task_id" not in record
 
 
 def test_task_log_context_propagates_attrs(buf: io.StringIO) -> None:
@@ -133,12 +142,24 @@ def test_local_attrs_override_global_attrs(buf: io.StringIO) -> None:
     assert records[1]["region"] == "eu-central"
 
 
-def test_global_attrs_override_auto_hostname(buf: io.StringIO) -> None:
-    """User-supplied hostname wins over what we auto-detect."""
-    setup_task_logging(global_log_attrs={"hostname": "container-a"}, stream=buf)
-    logging.getLogger("biz").info("hi")
-    [record] = _read_json_lines(buf)
-    assert record["hostname"] == "container-a"
+def test_user_can_overwrite_stdlib_record_fields(buf: io.StringIO) -> None:
+    """No protection against clobbering stdlib LogRecord names — by design.
+
+    If a user binds `task_log_context({"name": "X"})`, `record.name`
+    becomes "X". Damage is contained to the per-record copy, and the
+    immediate, visible behaviour is better feedback than silently dropping
+    the key. See filters.py module docstring for the full rationale.
+    """
+    setup_task_logging(stream=buf)
+    log = logging.getLogger("biz")
+
+    log.info("normal")
+    with task_log_context({"name": "user-override"}):
+        log.info("overridden")
+
+    records = _read_json_lines(buf)
+    assert records[0]["name"] == "biz"
+    assert records[1]["name"] == "user-override"
 
 
 def test_task_log_context_imperative_enter_exit(buf: io.StringIO) -> None:

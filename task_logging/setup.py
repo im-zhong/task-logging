@@ -76,9 +76,9 @@ def setup_task_logging(
             A dict of attrs stamped on every record for the lifetime of the
             process. Pick whatever keys your domain wants — e.g.
             ``{"service": "OrderService", "env": "prod", "region": "us"}``.
-            Any key colliding with a stdlib `LogRecord` attribute (or
-            `hostname`, which we auto-detect) is silently ignored to protect
-            record integrity.
+            The library does not protect stdlib `LogRecord` attribute names;
+            if you bind `{"name": "X"}`, `record.name` becomes "X". See
+            `task_logging/filters.py` for why.
         level:
             Root log level. Stdlib levels (`logging.INFO`) or names ("INFO").
         stream:

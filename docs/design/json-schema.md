@@ -2,15 +2,14 @@
 
 > The `JsonFormatter` emits keys like `created`, `levelname`, `name`,
 > `message`, `pathname`, `funcName`, `lineno`, `process`, `thread`,
-> `threadName`, `module`, `exc_info`, plus our own `service`, `env`,
-> `hostname`, `task_id`, and any extras. Where do those names come from?
-> Is there a standard?
+> `threadName`, `module`, `exc_info`, plus whatever attrs the user
+> supplied via `global_log_attrs` and `task_log_context`. Where do those
+> names come from? Is there a standard?
 
 Short answer: **the keys mirror stdlib `LogRecord` attribute names
-exactly**, plus a small handful of fields we invented that don't exist
-on a `LogRecord` (`service`, `env`, `hostname`, `task_id`, plus your
-`task_log_context` extras). The stdlib reference is *also* the JSON schema
-reference:
+exactly**. The library itself does not invent any field — `service`,
+`env`, `task_id` and friends are all conventions the user picks. The
+stdlib reference is *also* the JSON schema reference:
 
 - https://docs.python.org/3/library/logging.html#logrecord-attributes
 
@@ -26,8 +25,8 @@ LogRecord (built by stdlib logging, ~25 attrs on record.__dict__)
     │
     ▼
 TaskLogFilter  →  stamps onto record.__dict__:
-    │                   service, env, hostname, task_id,
-    │                   + every key from task_log_context({...})
+    │                   global_log_attrs (from setup_task_logging)
+    │                 + every key from the active task_log_context
     ▼
 JsonFormatter      →  emits record.__dict__ verbatim,
     │                 minus a small drop-list (_DROPPED_LOGRECORD_ATTRS),
@@ -44,7 +43,7 @@ we list the few we *don't* want. Adding a new field anywhere upstream
 binding a new one via `task_log_context`) shows up in the JSON
 automatically.
 
-Every key in the JSON falls into one of four groups below.
+Every key in the JSON falls into one of the four groups below.
 
 ## Group 1: stdlib `LogRecord` attributes, kept verbatim
 
@@ -70,43 +69,37 @@ you already know the schema. The JSON spelling for `funcName` is
 what stdlib calls it — picking a different spelling would just create a
 parallel naming convention readers have to memorise.
 
-## Group 2: auto-detected by `TaskLogFilter`
-
-Currently exactly one key. The filter is deliberately stingy here —
-every name added would be one more domain assumption baked in.
-
-| JSON key | Source | Why this name |
-|---|---|---|
-| `hostname` | `socket.gethostname()` | Self-explanatory. There's no `record.hostname` in stdlib — it's our concept. Auto-detected as a convenience because it's a process fact, not a domain choice. Users can override it by supplying their own `hostname` in `global_log_attrs` or `task_log_context`. |
-
 Note we deliberately do NOT add a `pid` field. Stdlib already populates
 `record.process`, which becomes the JSON `process` key — duplicating it
 under a second name would contradict "JSON keys mirror LogRecord."
 
-## Group 3: rendered by the formatter itself
+## Group 2: rendered by the formatter itself
 
 | JSON key | What it is |
 |---|---|
 | `exc_info` | A nested object built by `_render_exc_info()` from `record.exc_info`. Always present — `null` if there was no exception, or `{name, details, stack_trace, locals_dict}` if there was. The KEY name (`exc_info`) matches the stdlib LogRecord attribute it derives from; only the *value shape* is ours. |
 
-## Group 4: user-supplied attrs
+## Group 3: user-supplied attrs
 
 Anything in `setup_task_logging(global_log_attrs={...})` or
 `task_log_context({...})` rides through to the JSON. The library does
 not name any field — `service`, `env`, `task_id`, `user_id`,
-`request_id`, `region` are all conventions you pick, not names the
-library bakes in.
+`request_id`, `region`, `hostname` are all conventions you pick, not
+names the library bakes in.
 
 | JSON key | Source |
 |---|---|
-| `service`, `env`, `region`, ... | Process-wide via `setup_task_logging(global_log_attrs={...})` (typically picked at app startup). |
+| `service`, `env`, `region`, `hostname`, ... | Process-wide via `setup_task_logging(global_log_attrs={...})` (typically picked at app startup). |
 | `task_id`, `request_id`, `user_id`, ... | Per-context via `task_log_context({...})` (typically picked per request). |
 
-Inner `task_log_context` overrides outer; user-supplied keys override
-auto-detected ones. Keys colliding with stdlib `LogRecord` attribute
-names are silently dropped to protect record integrity.
+Inner `task_log_context` overrides outer, and `task_log_context` overrides
+`global_log_attrs`. There is no protection against user keys colliding
+with stdlib `LogRecord` attribute names — if you bind
+`task_log_context({"name": "X"})`, `record.name` becomes "X". See
+[task-context.md](task-context.md) "Why we don't protect stdlib field
+names from being overwritten" for the rationale.
 
-## Group 5: `_DROPPED_LOGRECORD_ATTRS` — the negative filter
+## Group 4: `_DROPPED_LOGRECORD_ATTRS` — the negative filter
 
 This is the actual implementation primitive: the formatter emits every
 attribute on `record.__dict__` *except* the names in this set. Listing
@@ -513,9 +506,8 @@ The matching code-level guard is in `formatters.py`:
 
 - Keys mirror stdlib `LogRecord` attribute names exactly, no renames.
 - Reference: https://docs.python.org/3/library/logging.html#logrecord-attributes
-- We add four fields that don't exist on a `LogRecord`: `service`,
-  the only auto-detected one is `hostname`. Everything else (`service`,
-  `env`, `task_id`, ...) is supplied by you via `global_log_attrs` or
+- The library auto-detects nothing. `service`, `env`, `hostname`, `task_id`
+  and friends are all supplied by you via `global_log_attrs` or
   `task_log_context`.
 - We drop redundant stdlib fields (`msecs`, `levelno`, `relativeCreated`,
   `processName`, `filename`, raw `msg`/`args`, `exc_text`, `stack_info`,

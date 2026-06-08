@@ -138,13 +138,11 @@ class TaskLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> logging.LogRecord:
         record = copy.copy(record)               # ← see "Why we copy"
 
-        record.hostname = _HOSTNAME              # auto-detected (lowest priority)
-
-        local_attrs = get_task_log_attrs()
-        for key, value in {**self._global_log_attrs, **local_attrs}.items():
-            if key in _RESERVED_LOGRECORD_ATTRS:
-                continue
-            setattr(record, key, value)          # global < local; user > auto
+        for key, value in {
+            **self._global_log_attrs,            # global (lowest priority)
+            **get_task_log_attrs(),              # local context (highest)
+        }.items():
+            setattr(record, key, value)
 
         return record                            # ← LogRecord, not bool
 ```
@@ -203,48 +201,43 @@ The upshot: even if a host app adds another handler to the root
 logger, our enrichment confines itself to the records flowing through
 *our* handler. Their records are pristine.
 
-### Why `_RESERVED_LOGRECORD_ATTRS` exists, and why the same names appear in `_DROPPED_LOGRECORD_ATTRS`
+### Why we don't protect stdlib field names from being overwritten
 
-These two sets are spelled with overlapping names but do **different
-jobs at different stages**:
+An earlier revision of the filter had a `_RESERVED_LOGRECORD_ATTRS`
+set listing every stdlib `LogRecord` attribute name (`msg`, `levelname`,
+`name`, ...) and silently dropped any user key that collided. The
+intent was to stop `task_log_context({"name": "PaymentService"})`
+from clobbering `record.name` (the logger name).
 
-| Set | Where | Job |
-|---|---|---|
-| `_RESERVED_LOGRECORD_ATTRS` | `filters.py` | "don't let user-supplied keys *overwrite* these record attrs" |
-| `_DROPPED_LOGRECORD_ATTRS` | `formatters.py` | "don't *emit* these record attrs in JSON output" |
+It's gone. Three reasons:
 
-They have overlapping membership (both list stdlib LogRecord names) but
-neither is a subset of the other:
+1. **Silent drop is bad UX.** A user binds
+   `task_log_context({"name": "PaymentService"})`, sees no `name=PaymentService`
+   in their JSON output, has no idea why. With no protection, they
+   *immediately* see `name=PaymentService` in the output, realise it's
+   replacing the logger name, and pick a different key. Tighter feedback
+   loop, no debugging required.
 
-- `levelname`, `name`, `created` are **reserved** (we don't want them
-  clobbered) but **kept** (we want them in JSON).
-- `args`, `levelno`, `processName` are **reserved AND dropped**.
+2. **Damage is contained.** We copy the record per handler-call (see
+   above), so any weirdness only affects this one record's JSON. If the
+   user manages to pick a collision that breaks formatting (e.g.
+   clobbers `msg` in a way `getMessage()` can't substitute), stdlib's
+   `Handler.emit` catches the formatter exception via `handleError`,
+   prints a traceback to stderr, and drops that line. Their program
+   keeps running. Other handlers' records are untouched.
 
-Without `_RESERVED_LOGRECORD_ATTRS`, a typo like
-`task_log_context(levelname="LOL")` would silently call
-`setattr(record, "levelname", "LOL")` and the JSON output would have
-`"levelname": "LOL"` instead of `"INFO"`. The protection is real.
+3. **The library doesn't pretend to know better than the user.** If
+   you ask for `levelname=URGENT` you get `levelname=URGENT`. The
+   library's job is to ferry your dict to the JSON output, not to
+   referee what your dict contains.
 
-What's *almost* redundant is the **list of stdlib attribute names
-itself** — both files need it, and one of them used to drift (an
-earlier revision had `taskName` dropped from JSON but not reserved,
-so `task_log_context(taskName="x")` would silently corrupt records).
-That source of truth lives in `task_logging/_logrecord.py` now, and
-both files import it. Each file then composes the names it needs:
-
-```python
-# filters.py
-_RESERVED_LOGRECORD_ATTRS = STDLIB_LOGRECORD_ATTRS | _FIELDS_WE_ADD
-
-# formatters.py
-_DROPPED_LOGRECORD_ATTRS = frozenset({"args", "asctime", ...})  # curated subset
-assert _DROPPED_LOGRECORD_ATTRS <= STDLIB_LOGRECORD_ATTRS        # invariant
-```
-
-The assertion is a guard rail: if a future contributor adds a name to
-the drop list that doesn't exist on a `LogRecord` (a typo, or an
-upstream stdlib rename), import fails loudly instead of producing
-silently-wrong output later.
+A separate set with overlapping membership lives on in `formatters.py`
+as `_DROPPED_LOGRECORD_ATTRS` — but its job is different: it lists
+stdlib attrs the formatter chooses to *omit from the JSON output*
+(redundant timestamps, internal `exc_text`, ...), not attrs that need
+protection from user clobbering. The two sets used to share a stdlib
+attribute name list (centralised in `task_logging/_logrecord.py` to
+avoid drift); now only the formatter side remains.
 
 ### Why the filter is on the handler, not on a logger
 
@@ -318,9 +311,8 @@ with task_log_context({"task_id": "task-42", "user_id": "u-1"}):
 
 4. The root handler's filters run. `TaskLogFilter.filter(record)` reads
    `_local_log_attrs.get()` (`{"task_id": "task-42", "user_id": "u-1"}`),
-   writes `record.hostname` (auto), and merges `global_log_attrs` +
-   `local_log_attrs` onto the record copy as `record.service`,
-   `record.task_id`, `record.user_id`.
+   merges it with `global_log_attrs`, and `setattr`s every key onto the
+   record copy: `record.service`, `record.task_id`, `record.user_id`.
 
 5. `JsonFormatter.format(record)` reads all those attributes off the
    record and produces (key names mirror stdlib `LogRecord` attributes;

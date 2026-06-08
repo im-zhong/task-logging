@@ -21,7 +21,8 @@ isn't just an opaque rewrite).
 |---|---|
 | `service_name` | `setup_task_logging(global_log_attrs={"service": ...})` — process-wide, set once at startup |
 | `task_id` | `task_log_context({"task_id": ...})` — per-request, flows via `contextvars` |
-| every other field (hostname, exc_info, frame info, …) | `TaskLogFilter` + stdlib's auto-populated `LogRecord` attributes |
+| every other field (exc_info, frame info, …) | `TaskLogFilter` + stdlib's auto-populated `LogRecord` attributes |
+| `hostname` | now user-supplied: pass `socket.gethostname()` in `global_log_attrs` if you want it. The deployment platform usually adds a better identifier (Kubernetes pod name, Docker container label) anyway. |
 
 The combination — not any single one of them — replaces what
 `TaskLogger` did. `task_log_context` alone is **not** a drop-in for
@@ -34,7 +35,7 @@ attached.
 |---|---|---|
 | Bind `service_name` to the logger | `TaskLogFilter` (set at `setup_task_logging` time) | `service` is process-wide; it belongs to one-time setup, not per-call. |
 | Bind `task_id` to the logger | `contextvars` + `task_log_context()` | `task_id` is per-request and now flows through threads / asyncio tasks automatically. See [task-context.md](task-context.md). |
-| Capture `hostname` | `TaskLogFilter` (cached at module import) | Same — was always per-process. |
+| Capture `hostname` | now user-supplied | Pass `socket.gethostname()` in `global_log_attrs` to keep the old behaviour. The library no longer auto-detects this — see "Why we don't auto-detect anything" in `task_logging/filters.py`. |
 | Capture `process_id` | stdlib auto-populates `record.process` | We don't even have to set it. |
 | Capture `thread_name` / `thread_id` | stdlib auto-populates `record.threadName` / `record.thread` | Free from stdlib. |
 | Capture `filename` / `module_name` / `function_name` / `line_no` (via `inspect.stack()` walk) | stdlib auto-populates `record.pathname` / `record.module` / `record.funcName` / `record.lineno` | The biggest improvement — see "Why this is better" below. |

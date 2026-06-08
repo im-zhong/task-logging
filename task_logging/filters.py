@@ -28,68 +28,59 @@ Why we COPY the record instead of mutating it:
     LogRecord (instead of a bool) and stdlib's Filterer.filter will use that
     record downstream in this handler's chain only.
 
-Merge order (lowest → highest priority; later writes overwrite earlier):
-    1. auto-detected     (currently just hostname)
-    2. global_log_attrs  (passed to setup_task_logging once at startup)
-    3. local_log_attrs   (whatever the active task_log_context bound)
-    The user always wins over auto-detection; nested task_log_context blocks
-    win over global setup. This matches the principle "users decide what's
-    in the record."
+Why we DON'T protect stdlib field names from being overwritten:
+    Earlier revisions had a `_RESERVED_LOGRECORD_ATTRS` set that silently
+    dropped user keys colliding with stdlib LogRecord attribute names
+    (`msg`, `levelname`, `name`, ...). We removed it. Reasons:
 
-See docs/design/task-context.md and docs/design/stdlib-logging-primer.md (§4).
+      - Silent drop is bad UX. User binds `task_log_context({"name": "X"})`,
+        sees no `name=X` in Grafana, has no idea why. With no protection
+        they see exactly what they bound, immediately learn to pick a
+        different key.
+      - Damage is contained. We copy the record per handler-call, so any
+        weirdness only affects this one record's JSON. If the override
+        causes `record.getMessage()` to raise (e.g. by clobbering `msg`
+        in a way incompatible with `args`), stdlib's `Handler.emit`
+        catches the formatter exception via `handleError`, prints a
+        traceback to stderr, and drops the line. The user's program is
+        unaffected.
+      - The library doesn't pretend to know better than the user. If you
+        ask for `levelname=URGENT` you get `levelname=URGENT`.
+
+Why we DON'T auto-detect anything (no hostname, no env, no nothing):
+    Earlier revisions auto-stamped `record.hostname = socket.gethostname()`
+    as a "convenience." Removed too. The amount of code, comments, and
+    override-precedence logic supporting "auto-detect one thing but let
+    the user override it" was wildly out of proportion to the value.
+    Hostname is one line of `socket.gethostname()` the user can put in
+    `global_log_attrs` themselves; the deployment platform usually adds a
+    better identifier (Kubernetes pod name, Docker container label) anyway.
+    Keep the library to the principle: users decide what's in the record.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
-import socket
 from typing import Any
 
-from ._logrecord import STDLIB_LOGRECORD_ATTRS
 from .context import get_task_log_attrs
-
-# Cached at module import. hostname is effectively immutable for the life
-# of the process; PID we don't need to stamp because stdlib already sets
-# `record.process` for us.
-_HOSTNAME = socket.gethostname()
-
-# Attribute names this filter writes itself with auto-detected values. The
-# library is deliberately stingy here — every name added to this set is one
-# more domain assumption baked in. Currently just hostname; everything else
-# (service, env, task_id, ...) is supplied by the user.
-#
-# Note: these names are NOT in _RESERVED_LOGRECORD_ATTRS. Users are
-# explicitly allowed to override auto-detected values — that's the whole
-# point of "user-given keys override auto-detected." We just write our
-# auto value first, then let the merge loop overwrite it if the user
-# supplied their own.
-_LOG_ATTRS_WE_ADD: frozenset[str] = frozenset({"hostname"})
-
-# Reserved keys: anything a user binds via `task_log_context({...})` or
-# `setup_task_logging(global_log_attrs={...})` is silently dropped if its
-# name collides with one of these. We protect every documented stdlib
-# LogRecord attribute (so e.g. `task_log_context({"msg": "..."})` doesn't
-# corrupt `record.msg` and break formatting). Auto-detected names are NOT
-# reserved — they're meant to be overridable.
-_RESERVED_LOGRECORD_ATTRS: frozenset[str] = STDLIB_LOGRECORD_ATTRS
 
 
 class TaskLogFilter(logging.Filter):
     """Attach task log attrs to every `LogRecord` on its way to a handler.
 
     Returns a COPY of the record with the enrichment applied; never drops
-    records, never mutates the original. See module docstring for why.
+    records, never mutates the original.
 
-    Sources merged onto each record (lowest → highest priority):
-        - `record.hostname`        (auto-detected at module import)
-        - `global_log_attrs`       (from `setup_task_logging`)
-        - active `task_log_context` attrs (from any enclosing context)
+    Sources merged onto each record (lower → higher priority; later writes
+    overwrite earlier):
+        - `global_log_attrs` (passed once to `setup_task_logging`)
+        - active `task_log_context` attrs (whatever's in scope right now)
 
-    Any user key colliding with a documented stdlib LogRecord attribute
-    (e.g. `msg`, `levelname`, `created`) is silently dropped to protect
-    record integrity. Auto-detected names like `hostname` are NOT reserved
-    — users may override them by supplying the same key.
+    The library does NOT protect stdlib LogRecord field names. If a user
+    binds e.g. `task_log_context({"name": "X"})`, `record.name` becomes
+    "X" — that's what they asked for. See module docstring for why.
     """
 
     def __init__(self, global_log_attrs: dict[str, Any] | None = None) -> None:
@@ -106,17 +97,10 @@ class TaskLogFilter(logging.Filter):
         # shared safely by reference.
         record = copy.copy(record)
 
-        # 1. Auto-detected. Lowest priority; user can override.
-        record.hostname = _HOSTNAME
-
-        # 2 & 3. Merge global_log_attrs (lowest of the user-supplied) and
-        # the currently-active task_log_context attrs (highest). Skip
-        # reserved keys so a well-meaning user can't accidentally clobber
-        # `record.msg`, `record.levelname`, or `record.hostname`.
-        local_attrs = get_task_log_attrs()
-        for key, value in {**self._global_log_attrs, **local_attrs}.items():
-            if key in _RESERVED_LOGRECORD_ATTRS:
-                continue
+        # Merge global (lowest of the user-supplied) and the currently-active
+        # task_log_context attrs (highest). Each value lands as an attribute
+        # on the record and rides through the formatter into the JSON output.
+        for key, value in {**self._global_log_attrs, **get_task_log_attrs()}.items():
             setattr(record, key, value)
 
         # Returning a LogRecord (not a bool) is stdlib-blessed: stdlib's

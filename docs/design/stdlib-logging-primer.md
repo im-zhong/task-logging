@@ -255,7 +255,6 @@ The interesting use of filters is **enrichment**, not filtering. Inside
 ```python
 class TaskLogFilter(logging.Filter):
     def filter(self, record):
-        record.hostname = _HOSTNAME
         for key, value in get_task_log_attrs().items():    # contextvar lookup
             setattr(record, key, value)
         return True   # never drop

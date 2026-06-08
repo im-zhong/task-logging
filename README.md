@@ -38,7 +38,7 @@ The library plugs into Python's stdlib `logging`, lets you bind whatever per-req
 ## Why this design?
 
 - **One central place for logs.** All services write JSON to stdout; the container runtime captures it; Alloy ships it to a single Loki, queryable from one Grafana instance.
-- **Trace a single request across services.** Every log line carries `task_id`, `service`, `hostname`, etc. Pick any of them in Grafana and follow the request end-to-end.
+- **Trace a single request across services.** Every log line carries whatever attrs you bound — `task_id`, `service`, `user_id`, anything. Pick any of them in Grafana and follow the request end-to-end.
 - **Third-party logs come along for free.** Because the library plugs into the stdlib root logger, anything that uses `logging` — `requests`, `urllib3`, `boto3`, `sqlalchemy`, your own modules — automatically gets the same JSON pipeline and the same `task_id` tag.
 - **Loki-friendly schema.** `service` / `env` / `level` are low-cardinality (good Loki labels). `task_id` and friends live inside the log line so they don't blow up Loki's stream cardinality.
 - **App stays simple — and 12-factor.** No log files, no rotation knobs, no HTTP, no batching, no retries. Just `print` to stdout (effectively). The platform handles capture, rotation, and shipping. See [12factor.net/logs](https://12factor.net/logs).
@@ -156,13 +156,12 @@ Every record is a single line of JSON with this stable shape. The keys mirror st
 
   "service":    "Billing",
   "env":        "prod",
-  "hostname":   "worker-7",
   "task_id":    "task-42",
   "user_id":    "u-1"
 }
 ```
 
-The first block mirrors stdlib LogRecord; the second block is whatever you bound. Only `hostname` is auto-detected by the library — `service`, `env`, `task_id`, `user_id` are all yours, supplied via `setup_task_logging(global_log_attrs=...)` and `task_log_context({...})`.
+The first block mirrors stdlib LogRecord; the second block is whatever **you** bound. The library does not auto-detect anything — `service`, `env`, `task_id`, `user_id` (and `hostname`, if you want it) are all supplied by you via `setup_task_logging(global_log_attrs=...)` and `task_log_context({...})`.
 
 `exc_info` is `null` for normal records and an object for exceptions:
 
