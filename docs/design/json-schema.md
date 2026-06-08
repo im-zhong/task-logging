@@ -258,6 +258,169 @@ Every other field on the record is already JSON-friendly *and* already
 on `record.__dict__`, so it sails through the comprehension without
 help.
 
+## Why we don't override `formatException`
+
+The Python [logging cookbook][cookbook-customex] has an example of a
+custom formatter that **overrides `formatException`** to flatten a
+traceback to one line. People who've read that page sometimes ask:
+"Shouldn't `JsonFormatter` override `formatException` too — for
+consistency?"
+
+[cookbook-customex]: https://docs.python.org/3/howto/logging-cookbook.html#customized-exception-formatting
+
+The answer is no, and the reason is worth recording because it's
+exactly the kind of thing that looks like an inconsistency until you
+see why.
+
+### What `formatException` is for in stdlib
+
+In stdlib's `Formatter.format()`, the relevant logic is roughly:
+
+```python
+def format(self, record):
+    record.message = record.getMessage()
+    s = self.formatMessage(record)              # the "main" line
+    if record.exc_info:
+        if not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+    if record.exc_text:
+        s = s + "\n" + record.exc_text          # appended to the main line
+    if record.stack_info:
+        s = s + "\n" + self.formatStack(record.stack_info)
+    return s
+```
+
+Two things to notice:
+
+1. `formatException` exists because stdlib's `format()` builds **a
+   single string** with the traceback **appended after a newline**. The
+   hook lets subclasses change *how the appended text looks*.
+2. The result is **cached on the record** as `record.exc_text` so
+   subsequent handlers don't re-format the same traceback.
+
+The cookbook example uses both: it overrides `formatException` to
+flatten the traceback to one line, and uses `record.exc_text` to detect
+"an exception was attached" so it can post-process the assembled
+string.
+
+### What our formatter does instead
+
+We don't build a string with a traceback appended. We build a JSON
+object with a structured `exc_info` field:
+
+```json
+"exc_info": {
+  "name": "ZeroDivisionError",
+  "details": "division by zero",
+  "stack_trace": "Traceback ...",
+  "locals_dict": {"a": "1", "b": "0"}
+}
+```
+
+The traceback isn't appended to anything — it's a value at a specific
+JSON key. So the question is: does our exception rendering need the
+hook stdlib provides? Three reasons it doesn't:
+
+#### 1. We never call `super().format()` or `super().formatException()`
+
+The cookbook example does `s = super().format(record)` and
+`super().formatException(exc_info)`. Stdlib's machinery runs, builds
+the appended-traceback string, caches `exc_text`, and they post-process
+it.
+
+We bypass that entirely. Our `format()` builds a dict from
+`record.__dict__`, computes `message`, renders our own `exc_info`
+object, and `json.dumps`. **The base-class string-assembly path never
+runs**, so the hook it offers (`formatException`) has no execution path
+that would call it. Overriding it would be defining a method that
+nothing invokes.
+
+#### 2. Our equivalent is `_render_exc_info`, and overriding *that* makes more sense
+
+We *do* have a method whose job is "turn `record.exc_info` into our
+preferred shape" — it's just called `_render_exc_info`. A future
+subclass that wants to customise exception rendering (drop locals,
+anonymise paths, redact secrets in stack traces, …) should override
+`_render_exc_info`, not `formatException`. The naming reflects what it
+actually does:
+
+| Method | Returns | Where it's called |
+|---|---|---|
+| `Formatter.formatException` | a `str` (multi-line traceback) | inside stdlib's string-assembly `format()` |
+| `JsonFormatter._render_exc_info` | a `dict` (structured exception object) | inside our JSON-assembly `format()` |
+
+If we *did* override `formatException`, it would have to return a `str`
+(the LSP contract for the base class). But our exception rendering
+returns a `dict`. So overriding it would either lie about the return
+type or be a useless wrapper that flattens our dict back to a string
+nobody asks for.
+
+#### 3. The cached `record.exc_text` would create a subtle bug
+
+Stdlib's `formatException` populates `record.exc_text` as a side effect,
+"for caching." If a record then propagates to *another* handler whose
+formatter is a stdlib-style text formatter, that second formatter sees
+a non-empty `exc_text` and skips its own `formatException` call — using
+whatever string our override returned.
+
+That's fine for the cookbook example (they're the only handler and own
+the format end-to-end). For us, if a host application has both a
+`JsonFormatter` handler and a stock `logging.StreamHandler` with a
+stdlib formatter, an override would silently corrupt the second
+handler's output.
+
+The current design sidesteps this entirely: we never touch
+`record.exc_text`, so other handlers' formatters render exceptions
+normally.
+
+### The pattern at the abstract level
+
+stdlib `Formatter` has three subclass-overridable points:
+
+```
+format(record)
+  ├─ formatMessage(record)      ← override to change the main line shape
+  ├─ formatException(exc_info)  ← override to change the appended traceback
+  └─ formatStack(stack_info)    ← override to change appended stack info
+```
+
+These three exist because stdlib's `format()` is **a
+string-concatenation pipeline with three stages**, and the hooks let
+you swap each stage independently.
+
+We replaced the whole pipeline with a **dict-construction pipeline**
+that has a different shape:
+
+```
+format(record)
+  ├─ comprehension over record.__dict__
+  ├─ getMessage()
+  ├─ _render_exc_info(record.exc_info)     ← our hook
+  └─ json.dumps(...)
+```
+
+So we have one hook in the analogous position (`_render_exc_info`),
+and it returns a `dict` because that's what JSON wants. There's no
+`formatStack` analogue because `record.stack_info` is already a string
+and rides through the comprehension; no `formatMessage` analogue
+because there's no "main line shape" to customise — the JSON shape *is*
+the schema.
+
+`formatException` is part of stdlib's *text*-formatting interface.
+Implementing it on a *JSON* formatter would be cargo-culting an
+abstraction that doesn't apply. The honest analogue is
+`_render_exc_info`, and we've got it.
+
+### When *would* we override `formatException`?
+
+If our formatter inherited the stdlib string-assembly path — i.e.
+produced text with the traceback appended — and we wanted, say, a
+one-line traceback. Or if we explicitly wanted to participate in the
+`record.exc_text` caching protocol so other handlers benefit.
+
+Neither applies to JSON output. The cache is a bug surface for us, not
+a feature.
+
 ## Why mirror stdlib names?
 
 We previously renamed several keys (`level`, `logger`, `msg`, `func`,

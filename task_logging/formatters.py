@@ -183,13 +183,35 @@ class JsonFormatter(logging.Formatter):
 
         return json.dumps(payload, default=_json_default, ensure_ascii=False)
 
-    # 这个函数的实现和第一版是差不多的
     def _render_exc_info(
         self,
         exc_info: tuple[type[BaseException], BaseException, TracebackType | None]
         | tuple[None, None, None]
         | bool,
     ) -> dict[str, Any] | None:
+        """Turn a raw exc_info tuple into a JSON-serialisable dict.
+
+        This is JsonFormatter's analogue to stdlib's `Formatter.formatException`,
+        but it returns a `dict` (for embedding in our JSON payload) rather
+        than a `str` (for appending to a text line). We deliberately do NOT
+        override `formatException`:
+
+          - stdlib's `format()` calls `formatException` only as part of its
+            text-concatenation pipeline; we never enter that pipeline, so
+            an override would never be invoked.
+          - `formatException` is contractually a `str`-returning method;
+            ours returns a `dict`.
+          - stdlib caches `formatException`'s result on `record.exc_text`,
+            which would then be picked up by any OTHER handler's stdlib
+            formatter on the same record and silently used as if it were
+            a normal traceback string.
+
+        Subclasses that want to customise exception rendering (drop locals,
+        anonymise paths, redact secrets, ...) should override THIS method.
+
+        See docs/design/json-schema.md "Why we don't override formatException"
+        for the longer treatment.
+        """
         # logging may pass `True` to mean "use sys.exc_info()".
         if exc_info is True:
             exc_info = sys.exc_info()
