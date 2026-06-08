@@ -1,4 +1,14 @@
-# Task Logging
+# Task Logging — v0.0.1 archive
+
+> **This file is historical.** It describes the original PostgreSQL-backed
+> `TaskLogger` design. The library has since pivoted to a
+> stdlib-logging + JSON + Grafana Alloy + Loki pipeline. Nothing here
+> describes the current code.
+>
+> If you're porting v0.0.1 code to the current version, see
+> [design/migrating-from-v0.0.1.md](design/migrating-from-v0.0.1.md)
+> for a capability-by-capability mapping and a code-level
+> walkthrough.
 
 ## install
 
