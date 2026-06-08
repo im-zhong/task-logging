@@ -75,8 +75,11 @@ setup_task_logging(
         "env": "prod",
     },
     level=logging.INFO,
-    quiet_loggers={"urllib3": logging.WARNING},   # tame noisy libs
 )
+
+# Tame noisy third-party libraries with stdlib (this isn't something
+# task_logging wraps — it's a one-line stdlib call):
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 ```
 
 After this, **every** stdlib logger in the process — yours and third-party — writes one line of **JSON** to **stdout**, ready for Alloy.
@@ -465,10 +468,11 @@ from task_logging import (
 import logging
 from task_logging import log_func_call, setup_task_logging, task_log_context
 
-setup_task_logging(
-    global_log_attrs={"service": "Billing", "env": "prod"},
-    quiet_loggers={"urllib3": logging.WARNING, "botocore": logging.WARNING},
-)
+setup_task_logging(global_log_attrs={"service": "Billing", "env": "prod"})
+
+# Silence noisy third-party libraries via stdlib:
+for chatty in ("urllib3", "botocore"):
+    logging.getLogger(chatty).setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
 

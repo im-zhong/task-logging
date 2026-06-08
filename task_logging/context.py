@@ -122,11 +122,26 @@ class task_log_context:  # noqa: N801 (callable-named-as-class is intentional �
         parent = _local_log_attrs.get() or {}
         merged: dict[str, Any] = {**parent, **self._attrs}
 
-        # ContextVar.set returns an opaque token that records EXACTLY what was
-        # there before. reset(token) restores precisely that, even under
-        # nesting and even when the body raises (the finally always runs).
-        # This is the stdlib's blessed pattern for save/restore; rolling our
-        # own would break under reentrancy.
+        # `Token` is contextvars' undo-receipt for a single set() call. It
+        # records the var's INTERNAL STATE before the set — not just the
+        # previous value. This distinction matters for the unset case:
+        #
+        #     # naive save-and-restore:
+        #     old = ctx_var.get()    # var was never set, returns the default
+        #     ctx_var.set("hi")
+        #     ctx_var.set(old)       # now var IS explicitly set to the default,
+        #                            # not "still unset"
+        #
+        # The two states (explicitly-set-to-default vs never-set) look the
+        # same to .get() but differ when the Context is copied or run via
+        # Context.run(). Token is how stdlib captures and restores the
+        # precise state without that ambiguity. It also pins the token to
+        # the var instance — passing token_a from var_a into var_b.reset()
+        # raises at runtime, so misuse fails loudly.
+        #
+        # Tokens nest: every set() returns a fresh token, every reset()
+        # consumes one, mirroring the call stack. The finally in __exit__
+        # ensures we reset even if the body raises.
         self._token = _local_log_attrs.set(merged)
         return merged
 

@@ -292,21 +292,6 @@ def test_capture_locals_can_be_disabled(buf: io.StringIO) -> None:
     assert record["exc_info"]["locals_dict"] == {}
 
 
-def test_quiet_loggers_are_silenced(buf: io.StringIO) -> None:
-    setup_task_logging(
-        stream=buf,
-        level=logging.DEBUG,
-        quiet_loggers={"chatty": logging.WARNING},
-    )
-
-    chatty = logging.getLogger("chatty")
-    chatty.info("should be dropped")
-    chatty.warning("should pass")
-
-    [record] = _read_json_lines(buf)
-    assert record["message"] == "should pass"
-
-
 def test_output_is_always_json_even_for_a_tty_like_stream() -> None:
     """No matter what the stream looks like, output is JSON."""
 

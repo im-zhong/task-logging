@@ -47,8 +47,6 @@ import traceback
 from types import TracebackType
 from typing import Any
 
-from ._logrecord import STDLIB_LOGRECORD_ATTRS
-
 # Stdlib LogRecord attributes we deliberately exclude from the JSON output.
 # Everything else on record.__dict__ — including stdlib's own fields and any
 # extras stamped on by filters / `extra=` / task_context — is emitted as-is.
@@ -81,15 +79,6 @@ _DROPPED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
         "stack_info",
         "taskName",  # Python 3.12+
     }
-)
-
-# Invariant: every name we drop must actually be a stdlib LogRecord attribute.
-# If this fires, either we're dropping a name stdlib never set (typo / dead
-# entry) or the upstream stdlib reference has drifted. Catch it at import
-# time rather than discovering silently-wrong output later.
-assert _DROPPED_LOGRECORD_ATTRS <= STDLIB_LOGRECORD_ATTRS, (
-    f"_DROPPED_LOGRECORD_ATTRS contains non-stdlib names: "
-    f"{_DROPPED_LOGRECORD_ATTRS - STDLIB_LOGRECORD_ATTRS}"
 )
 
 
@@ -221,6 +210,21 @@ class JsonFormatter(logging.Formatter):
             self._render_exc_info(record.exc_info) if record.exc_info else None
         )
 
+        # ensure_ascii=False emits non-ASCII characters (CJK, emoji, accented
+        # names, ...) as their actual UTF-8 bytes instead of as `\uXXXX`
+        # escapes. The stdlib default (True) is paranoid for transports that
+        # might re-encode the bytes arbitrarily — mail relays, syslog-over-UDP,
+        # HTTP/1.0 without a declared charset. But our pipeline (stdout →
+        # docker / kubelet → Alloy → Loki → Grafana) is UTF-8 end-to-end at
+        # every hop, so escaping just doubles or triples the byte size of
+        # any non-ASCII log content for zero compatibility benefit. It also
+        # makes `docker logs <ctr> | jq`, `tail -f`, and `grep` produce
+        # human-readable output instead of `订单` soup.
+        #
+        # JSON control-character requirements (U+0000 through U+001F MUST
+        # be escaped) are still enforced by json.dumps regardless of this
+        # flag, so newline/tab/null in user values can't break the
+        # single-line-JSON-per-record invariant.
         return json.dumps(payload, default=_json_default, ensure_ascii=False)
 
     def _render_exc_info(

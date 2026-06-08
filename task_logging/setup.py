@@ -67,7 +67,6 @@ def setup_task_logging(
     level: int | str = logging.INFO,
     stream: IO[str] | None = None,
     capture_locals: bool = True,
-    quiet_loggers: dict[str, int] | None = None,
 ) -> logging.Logger:
     """Configure the root logger to write JSON to stdout for Alloy / Loki.
 
@@ -88,9 +87,6 @@ def setup_task_logging(
             If True, exception logs include a repr-snapshot of the local
             variables at the deepest frame. Disable in low-trust environments
             where locals might leak secrets.
-        quiet_loggers:
-            Map of logger name -> level. Useful for taming chatty third-party
-            libraries, e.g. `{"urllib3": logging.WARNING}`.
 
     Returns:
         The configured root logger.
@@ -98,12 +94,17 @@ def setup_task_logging(
     Example:
         >>> setup_task_logging(
         ...     global_log_attrs={"service": "OrderService", "env": "prod"},
-        ...     quiet_loggers={"urllib3": logging.WARNING},
         ... )
 
         For human-readable output at a terminal, pipe through `jq`:
 
             $ python -m myapp | jq
+
+        To silence a chatty third-party library, use stdlib directly — this
+        is just a logger-level adjustment and not something the library
+        wraps::
+
+            logging.getLogger("urllib3").setLevel(logging.WARNING)
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -130,13 +131,6 @@ def setup_task_logging(
     _tag(handler)
     root.addHandler(handler)
 
-    if quiet_loggers:
-        # Setting a level on a parent logger silences every child below it
-        # via stdlib's effective-level inheritance. So "urllib3"=WARNING
-        # also silences "urllib3.connectionpool", "urllib3.util", etc.
-        for name, lvl in quiet_loggers.items():
-            logging.getLogger(name).setLevel(lvl)
-
     return root
 
 
@@ -154,13 +148,12 @@ def shutdown_task_logging() -> None:
 
     What this does NOT do, by design:
 
-      - Does not restore `quiet_loggers` level changes. Recovering the
-        per-logger pre-setup level would require us to remember each
-        prior level (none of which we actually need to do our job),
-        and the result would still be best-effort.
       - Does not restore the root logger's prior level.
       - Does not reset the active `task_log_context` ContextVar — that's
         per-task scope, not bound to setup/shutdown lifetime.
+      - Does not undo any per-logger level changes a caller made
+        manually (e.g. `logging.getLogger("urllib3").setLevel(WARNING)`).
+        Those are the caller's, not ours.
 
     The intent is "dispose of resources we own (the handler) and let
     other state lapse on its own." If you need a precise pre-setup
