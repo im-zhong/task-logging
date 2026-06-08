@@ -47,6 +47,8 @@ import traceback
 from types import TracebackType
 from typing import Any
 
+from ._logrecord import STDLIB_LOGRECORD_ATTRS
+
 # Stdlib LogRecord attributes we deliberately exclude from the JSON output.
 # Everything else on record.__dict__ — including stdlib's own fields and any
 # extras stamped on by filters / `extra=` / task_context — is emitted as-is.
@@ -64,8 +66,6 @@ from typing import Any
 #   filename              -- redundant with `pathname` (basename only)
 #   taskName              -- asyncio task name, conflicts semantically with
 #                            our `task_id`
-#
-# Reference: https://docs.python.org/3/library/logging.html#logrecord-attributes
 _DROPPED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
     {
         "args",
@@ -79,8 +79,17 @@ _DROPPED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
         "processName",
         "relativeCreated",
         "stack_info",
-        # "taskName",  # Python 3.12+
+        "taskName",  # Python 3.12+
     }
+)
+
+# Invariant: every name we drop must actually be a stdlib LogRecord attribute.
+# If this fires, either we're dropping a name stdlib never set (typo / dead
+# entry) or the upstream stdlib reference has drifted. Catch it at import
+# time rather than discovering silently-wrong output later.
+assert _DROPPED_LOGRECORD_ATTRS <= STDLIB_LOGRECORD_ATTRS, (
+    f"_DROPPED_LOGRECORD_ATTRS contains non-stdlib names: "
+    f"{_DROPPED_LOGRECORD_ATTRS - STDLIB_LOGRECORD_ATTRS}"
 )
 
 

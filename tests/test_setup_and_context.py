@@ -114,6 +114,52 @@ def test_bind_unbind_pair(buf: io.StringIO) -> None:
     assert record["region"] == "us-west"
 
 
+def test_filter_does_not_mutate_the_original_record(buf: io.StringIO) -> None:
+    """Enrichment must land on a copy, so other handlers see the unmodified record.
+
+    A host application might install a second handler (Sentry, a debug
+    StreamHandler, ...) on the same logger tree. Our filter must not leak its
+    enriched attributes onto records they're processing.
+    """
+    setup_logging(service="svc", stream=buf)
+    log = logging.getLogger("biz")
+
+    # Create a record by hand, the way logging.Logger.makeRecord would, then
+    # push it through our filter directly. Pytest installs its own root
+    # handler for log capture, so pick our one out by the private tag.
+    our_handler = next(
+        h
+        for h in logging.getLogger().handlers
+        if getattr(h, "_task_logging_tag", None) == "task_logging.handler"
+    )
+    [ctx_filter] = our_handler.filters
+    original = log.makeRecord(
+        name="biz",
+        level=logging.INFO,
+        fn=__file__,
+        lno=1,
+        msg="hi",
+        args=(),
+        exc_info=None,
+    )
+
+    with task_context(task_id="t-1", user_id="u-1"):
+        enriched = ctx_filter.filter(original)
+
+    assert enriched is not original
+    assert isinstance(enriched, logging.LogRecord)
+
+    # Enriched record carries the context.
+    assert enriched.task_id == "t-1"
+    assert enriched.user_id == "u-1"
+    assert enriched.service == "svc"
+
+    # Original record carries NONE of it — the contract another handler relies on.
+    assert not hasattr(original, "task_id")
+    assert not hasattr(original, "user_id")
+    assert not hasattr(original, "service")
+
+
 def test_third_party_logger_inherits_context(buf: io.StringIO) -> None:
     """A child logger (mimicking urllib3 / requests) is enriched too."""
     setup_logging(service="svc", stream=buf)

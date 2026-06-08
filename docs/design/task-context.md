@@ -114,16 +114,17 @@ So `_task_ctx` holds the right value. How does it end up on a log line?
 
 Through a `logging.Filter`. Filters in stdlib `logging` are misnamed — yes
 they can drop records by returning `False`, but they are also the
-**canonical place to mutate records before formatting**. Ours never drops
-anything; it only enriches:
+**canonical place to enrich records before formatting**. Ours never drops
+anything; it only enriches, and it does so on a *copy* of the record:
 
 ```python
 class TaskContextFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
+    def filter(self, record: logging.LogRecord) -> logging.LogRecord:
+        record = copy.copy(record)               # ← see "Why we copy"
+
         record.service = self._service
         record.env = self._env
         record.hostname = _HOSTNAME
-        record.pid = _PID
 
         ctx = get_task_context()
         record.task_id = ctx.get("task_id")
@@ -132,17 +133,106 @@ class TaskContextFilter(logging.Filter):
             if key in _RESERVED_LOGRECORD_ATTRS:
                 continue
             setattr(record, key, value)
-        return True
+
+        return record                            # ← LogRecord, not bool
 ```
 
 `setup_logging` attaches this filter to the stdout handler. So every
 record emitted by **any** logger in the process — your code, `urllib3`,
 `boto3`, anything — passes through this filter on its way out, and gets
 `record.task_id`, `record.service`, plus every key in the active context
-dict, slapped onto it as an attribute.
+dict, set as attributes on a fresh copy.
 
-Then `JsonFormatter` reads those attributes off the record and writes them
-as JSON.
+Then `JsonFormatter` reads those attributes off the (copied) record and
+writes them as JSON.
+
+### Why we copy the record instead of mutating it
+
+`logging` passes each `LogRecord` *by reference* to every handler in the
+chain. If we mutated the record in place, our enrichment would leak onto
+the same record object as it travels to **other** handlers the host
+application has installed:
+
+```
+log.info(...)
+  → makeRecord(...)                    # one LogRecord r
+  → handler_A (ours)
+       → TaskContextFilter mutates r.task_id = "abc"
+  → handler_B (e.g. Sentry, debug StreamHandler)
+       → sees r.task_id = "abc" too — wasn't asked for, may not want
+```
+
+For our specific topology (one handler we own) this never bites in
+practice. But "the host app might install another handler" is a
+plausible thing — Sentry's breadcrumb handler, a debug
+`StreamHandler`, a custom audit logger — and the cookbook
+[Imparting contextual information in handlers][cookbook-handlers]
+documents the canonical fix: have the filter return a *new* record
+instead of modifying in place.
+
+[cookbook-handlers]: https://docs.python.org/3/howto/logging-cookbook.html#imparting-contextual-information-in-handlers
+
+stdlib supports this directly. `Filterer.filter` (the base class behind
+both `Logger` and `Handler`) accepts either a `bool` or a `LogRecord`
+from each filter; if a filter returns a record, that record replaces
+the original *for this chain only*. So:
+
+- `return True` / `return False` → keep / drop the original record
+- `return record` (a fresh `LogRecord`) → use this enriched copy in this
+  chain, leave the original unchanged for any sibling handlers
+
+We use the third option: `copy.copy(record)`, mutate the copy, return
+it. The cost is one shallow copy per record per handler. `LogRecord`'s
+state is mostly its `__dict__`, which `copy.copy` duplicates; the
+expensive bits — `exc_info` tuples, traceback frames, source code paths
+— are immutable from our perspective and shared safely by reference.
+
+The upshot: even if a host app adds another handler to the root
+logger, our enrichment confines itself to the records flowing through
+*our* handler. Their records are pristine.
+
+### Why `_RESERVED_LOGRECORD_ATTRS` exists, and why the same names appear in `_DROPPED_LOGRECORD_ATTRS`
+
+These two sets are spelled with overlapping names but do **different
+jobs at different stages**:
+
+| Set | Where | Job |
+|---|---|---|
+| `_RESERVED_LOGRECORD_ATTRS` | `filters.py` | "don't let user-supplied keys *overwrite* these record attrs" |
+| `_DROPPED_LOGRECORD_ATTRS` | `formatters.py` | "don't *emit* these record attrs in JSON output" |
+
+They have overlapping membership (both list stdlib LogRecord names) but
+neither is a subset of the other:
+
+- `levelname`, `name`, `created` are **reserved** (we don't want them
+  clobbered) but **kept** (we want them in JSON).
+- `args`, `levelno`, `processName` are **reserved AND dropped**.
+
+Without `_RESERVED_LOGRECORD_ATTRS`, a typo like
+`task_context(levelname="LOL")` would silently call
+`setattr(record, "levelname", "LOL")` and the JSON output would have
+`"levelname": "LOL"` instead of `"INFO"`. The protection is real.
+
+What's *almost* redundant is the **list of stdlib attribute names
+itself** — both files need it, and one of them used to drift (an
+earlier revision had `taskName` dropped from JSON but not reserved,
+so `task_context(taskName="x")` would silently corrupt records).
+That source of truth lives in `task_logging/_logrecord.py` now, and
+both files import it. Each file then composes the names it needs:
+
+```python
+# filters.py
+_RESERVED_LOGRECORD_ATTRS = STDLIB_LOGRECORD_ATTRS | _FIELDS_WE_ADD
+
+# formatters.py
+_DROPPED_LOGRECORD_ATTRS = frozenset({"args", "asctime", ...})  # curated subset
+assert _DROPPED_LOGRECORD_ATTRS <= STDLIB_LOGRECORD_ATTRS        # invariant
+```
+
+The assertion is a guard rail: if a future contributor adds a name to
+the drop list that doesn't exist on a `LogRecord` (a typo, or an
+upstream stdlib rename), import fails loudly instead of producing
+silently-wrong output later.
 
 ### Why the filter is on the handler, not on a logger
 
