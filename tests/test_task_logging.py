@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import threading
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -18,7 +19,7 @@ from task_logging import (
 )
 
 
-def _read_json_lines(buf: io.StringIO) -> list[dict]:
+def _read_json_lines(buf: io.StringIO) -> list[dict[str, Any]]:
     return [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
 
 
@@ -57,7 +58,7 @@ def _reset_root_logger() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_logging():
+def _isolated_logging() -> Iterator[None]:
     _reset_root_logger()
     yield
     _reset_root_logger()
@@ -249,7 +250,11 @@ def test_filter_does_not_mutate_the_original_record(buf: io.StringIO) -> None:
     handler = _install_handler(stream=buf, global_log_attrs={"service": "svc"})
     log = logging.getLogger("biz")
 
+    # handler.filters is typed loosely (Filter | Callable | _SupportsFilter)
+    # in typeshed; we know we put a TaskLogFilter there ourselves.
     [ctx_filter] = handler.filters
+    assert isinstance(ctx_filter, TaskLogFilter)
+
     original = log.makeRecord(
         name="biz",
         level=logging.INFO,
@@ -266,10 +271,12 @@ def test_filter_does_not_mutate_the_original_record(buf: io.StringIO) -> None:
     assert enriched is not original
     assert isinstance(enriched, logging.LogRecord)
 
-    # Enriched record carries the context.
-    assert enriched.task_id == "t-1"
-    assert enriched.user_id == "u-1"
-    assert enriched.service == "svc"
+    # Enriched record carries the context. Read with getattr because
+    # task_id/user_id/service are runtime-stamped attrs not in stdlib's
+    # LogRecord stubs.
+    assert getattr(enriched, "task_id", None) == "t-1"
+    assert getattr(enriched, "user_id", None) == "u-1"
+    assert getattr(enriched, "service", None) == "svc"
 
     # Original record carries NONE of it — the contract another handler relies on.
     assert not hasattr(original, "task_id")
