@@ -70,12 +70,29 @@ from .context import get_task_log_attrs
 class TaskLogFilter(logging.Filter):
     """Attach task log attrs to every `LogRecord` on its way to a handler.
 
+    *** Attach this filter to a HANDLER, not a Logger. ***
+
+    Logger-level filters only see records emitted *directly* on that logger;
+    they do NOT see records that propagate up from child loggers. So a filter
+    on the root logger would NOT enrich records emitted by `urllib3` or
+    `boto3`. Handler-level filters see every record that reaches the handler
+    via propagation. That's the behaviour that makes "tag third-party logs
+    automatically" possible. See the module docstring and
+    docs/design/stdlib-logging-primer.md for the full story.
+
+    Canonical wiring::
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(JsonFormatter())
+        handler.addFilter(TaskLogFilter(global_log_attrs={"service": "x"}))
+        logging.getLogger().addHandler(handler)
+
     Returns a COPY of the record with the enrichment applied; never drops
     records, never mutates the original.
 
     Sources merged onto each record (lower → higher priority; later writes
     overwrite earlier):
-        - `global_log_attrs` (passed once to `setup_task_logging`)
+        - `global_log_attrs` (passed at filter construction)
         - active `task_log_context` attrs (whatever's in scope right now)
 
     The library does NOT protect stdlib LogRecord field names. If a user
