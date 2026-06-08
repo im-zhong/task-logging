@@ -1,16 +1,20 @@
-# How `task_context` works
+# How `task_log_context` works
 
-`task_context` is the most important piece of the library and the part whose
-mechanics are least obvious. This note explains how it makes `task_id` flow
-through threads, asyncio tasks, and even third-party libraries' logs —
-without modifying anything about those libraries.
+`task_log_context` is the most important piece of the library and the part whose
+mechanics are least obvious. This note explains how it makes a user-supplied
+dict of log attrs flow through threads, asyncio tasks, and even third-party
+libraries' logs — without modifying anything about those libraries.
+
+(In the examples below we bind `task_id` because it's a familiar name, but the
+library doesn't privilege any particular key; pick whatever your domain
+calls for.)
 
 ## The problem
 
 We want this:
 
 ```python
-with task_context(task_id="task-42"):
+with task_log_context({"task_id": "task-42"}):
     log.info("step 1")               # ← tagged "task-42"
     do_some_work()                   # ← logs in here are tagged
     requests.get("https://...")      # ← urllib3's internal logs are tagged
@@ -19,21 +23,21 @@ log.info("after")                    # ← back to no task_id
 
 Three things have to be true for this to work:
 
-1. The `task_id` must be **available to every logger in the process** without
-   passing it explicitly down through every function call.
-2. It must be **automatically restored** when the block exits — including
+1. The bound attrs must be **available to every logger in the process** without
+   passing them explicitly down through every function call.
+2. They must be **automatically restored** when the block exits — including
    when the block exits via an exception.
-3. It must be **isolated per request** — concurrent requests in different
-   threads or asyncio tasks must not see each other's `task_id`.
+3. They must be **isolated per request** — concurrent requests in different
+   threads or asyncio tasks must not see each other's attrs.
 
-`task_context` solves this by combining three stdlib primitives:
+`task_log_context` solves this by combining three stdlib primitives:
 `contextvars.ContextVar`, `logging.Filter`, and `logging.LogRecord`.
 
 ## Piece 1: `contextvars.ContextVar` — the storage
 
 ```python
-_task_ctx: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "task_logging_ctx", default=None
+_local_log_attrs: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "task_logging_local_log_attrs", default=None
 )
 ```
 
@@ -58,35 +62,47 @@ would leak everywhere, in every thread, forever. ruff's `B039` rule catches
 this exact bug.
 
 So our default is `None`, and we allocate a fresh dict every time we set the
-var. `get_task_context()` returns an empty dict when the var is `None`,
+var. `get_task_log_attrs()` returns an empty dict when the var is `None`,
 which keeps callers from having to handle the None case themselves.
 
-## Piece 2: `task_context()` — set / restore via tokens
+## Piece 2: `task_log_context` — set / restore via tokens
 
 ```python
-@contextmanager
-def task_context(task_id=None, **extra):
-    parent = _task_ctx.get() or {}
-    merged = {**parent, **extra}
-    merged["task_id"] = task_id if task_id is not None else uuid.uuid4().hex
-    token = _task_ctx.set(merged)        # ← returns a token
-    try:
-        yield merged
-    finally:
-        _task_ctx.reset(token)           # ← restores the prior state
+class task_log_context:
+    def __init__(self, attrs: dict[str, Any] | None = None, /) -> None:
+        self._attrs = dict(attrs) if attrs else {}
+        self._token = None
+
+    def __enter__(self) -> dict[str, Any]:
+        parent = _local_log_attrs.get() or {}
+        merged = {**parent, **self._attrs}
+        self._token = _local_log_attrs.set(merged)   # ← returns a token
+        return merged
+
+    def __exit__(self, *exc_info) -> None:
+        _local_log_attrs.reset(self._token)          # ← restores the prior state
 ```
 
-Two design choices to notice.
+Three design choices to notice.
+
+### The dict is positional-only and the only argument
+
+`task_log_context({...})`, not `task_log_context(task_id=..., **extra)`. The
+library does not name any field — it accepts whatever dict you pass and
+merges it into the current context. The earlier API privileged `task_id`
+with a positional kwarg and an auto-UUID fallback; that's been removed
+because it baked a domain assumption ("there's always a task with an id")
+into a generic logging library. If you want a UUID, generate one yourself.
 
 ### Inheritance: nested contexts merge with their parent
 
-If you nest `task_context` calls, the inner one inherits everything the outer
-one set:
+If you nest `task_log_context` blocks, the inner one inherits everything the
+outer one set:
 
 ```python
-with task_context(task_id="outer", region="us-west"):
+with task_log_context({"task_id": "outer", "region": "us-west"}):
     # ctx = {task_id: "outer", region: "us-west"}
-    with task_context(task_id="inner"):
+    with task_log_context({"task_id": "inner"}):
         # ctx = {task_id: "inner", region: "us-west"}  ← region inherited
         ...
 ```
@@ -108,9 +124,9 @@ A naïve "save the old value, restore on exit" would also work for simple
 cases but break under reentrancy. Tokens are the stdlib's blessed mechanism
 for this and it's worth using them as designed.
 
-## Piece 3: `TaskContextFilter` — connecting context to logs
+## Piece 3: `TaskLogFilter` — connecting context to logs
 
-So `_task_ctx` holds the right value. How does it end up on a log line?
+So `_local_log_attrs` holds the right value. How does it end up on a log line?
 
 Through a `logging.Filter`. Filters in stdlib `logging` are misnamed — yes
 they can drop records by returning `False`, but they are also the
@@ -118,30 +134,26 @@ they can drop records by returning `False`, but they are also the
 anything; it only enriches, and it does so on a *copy* of the record:
 
 ```python
-class TaskContextFilter(logging.Filter):
+class TaskLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> logging.LogRecord:
         record = copy.copy(record)               # ← see "Why we copy"
 
-        record.service = self._service
-        record.env = self._env
-        record.hostname = _HOSTNAME
+        record.hostname = _HOSTNAME              # auto-detected (lowest priority)
 
-        ctx = get_task_context()
-        record.task_id = ctx.get("task_id")
-
-        for key, value in {**self._extra, **ctx}.items():
+        local_attrs = get_task_log_attrs()
+        for key, value in {**self._global_log_attrs, **local_attrs}.items():
             if key in _RESERVED_LOGRECORD_ATTRS:
                 continue
-            setattr(record, key, value)
+            setattr(record, key, value)          # global < local; user > auto
 
         return record                            # ← LogRecord, not bool
 ```
 
-`setup_logging` attaches this filter to the stdout handler. So every
+`setup_task_logging` attaches this filter to the stdout handler. So every
 record emitted by **any** logger in the process — your code, `urllib3`,
 `boto3`, anything — passes through this filter on its way out, and gets
-`record.task_id`, `record.service`, plus every key in the active context
-dict, set as attributes on a fresh copy.
+every key from `global_log_attrs` and the active `task_log_context`
+attrs, set as attributes on a fresh copy.
 
 Then `JsonFormatter` reads those attributes off the (copied) record and
 writes them as JSON.
@@ -157,7 +169,7 @@ application has installed:
 log.info(...)
   → makeRecord(...)                    # one LogRecord r
   → handler_A (ours)
-       → TaskContextFilter mutates r.task_id = "abc"
+       → TaskLogFilter mutates r.task_id = "abc"
   → handler_B (e.g. Sentry, debug StreamHandler)
        → sees r.task_id = "abc" too — wasn't asked for, may not want
 ```
@@ -209,14 +221,14 @@ neither is a subset of the other:
 - `args`, `levelno`, `processName` are **reserved AND dropped**.
 
 Without `_RESERVED_LOGRECORD_ATTRS`, a typo like
-`task_context(levelname="LOL")` would silently call
+`task_log_context(levelname="LOL")` would silently call
 `setattr(record, "levelname", "LOL")` and the JSON output would have
 `"levelname": "LOL"` instead of `"INFO"`. The protection is real.
 
 What's *almost* redundant is the **list of stdlib attribute names
 itself** — both files need it, and one of them used to drift (an
 earlier revision had `taskName` dropped from JSON but not reserved,
-so `task_context(taskName="x")` would silently corrupt records).
+so `task_log_context(taskName="x")` would silently corrupt records).
 That source of truth lives in `task_logging/_logrecord.py` now, and
 both files import it. Each file then composes the names it needs:
 
@@ -262,18 +274,18 @@ Three things conspire:
    `urllib3.connectionpool` is a child of `urllib3` is a child of root.
    When `urllib3.connectionpool` emits a record, the record propagates up
    the tree until it hits a handler. By default, only the root has a
-   handler — the one we installed in `setup_logging`.
+   handler — the one we installed in `setup_task_logging`.
 
 2. **The filter is on the handler, not on individual loggers.** So every
    record that reaches the root handler — regardless of which logger
-   emitted it — passes through `TaskContextFilter`.
+   emitted it — passes through `TaskLogFilter`.
 
-3. **ContextVars don't care who you are.** Inside the `with task_context(...)`
-   block, `_task_ctx.get()` returns the right dict no matter where in the
+3. **ContextVars don't care who you are.** Inside the `with task_log_context(...)`
+   block, `_local_log_attrs.get()` returns the right dict no matter where in the
    call stack you are. `requests` calls `urllib3` calls some socket code
    calls `logging.getLogger("urllib3.connectionpool").warning(...)` — the
    warning's record reaches the root handler, the filter calls
-   `_task_ctx.get()`, and the answer is still
+   `_local_log_attrs.get()`, and the answer is still
    `{"task_id": "task-42", ...}`.
 
 That's the whole magic. There's no patching of third-party libraries, no
@@ -285,28 +297,30 @@ mechanisms used as designed.
 Here's what happens when you write:
 
 ```python
-setup_logging(service="OrderService")
+setup_task_logging(global_log_attrs={"service": "OrderService"})
 log = logging.getLogger("biz")
 
-with task_context(task_id="task-42", user_id="u-1"):
+with task_log_context({"task_id": "task-42", "user_id": "u-1"}):
     log.info("hello")
 ```
 
-1. `setup_logging` creates a `StreamHandler(sys.stdout)`, attaches a
-   `TaskContextFilter(service="OrderService")` and a `JsonFormatter`,
-   and adds the handler to the **root** logger.
+1. `setup_task_logging` creates a `StreamHandler(sys.stdout)`, attaches a
+   `TaskLogFilter(global_log_attrs={"service": "OrderService"})` and a
+   `JsonFormatter`, and adds the handler to the **root** logger.
 
-2. `task_context(...)` builds `{"task_id": "task-42", "user_id": "u-1"}`
-   and calls `_task_ctx.set(...)`, getting back a token.
+2. Entering `task_log_context({"task_id": "task-42", "user_id": "u-1"})`
+   merges `{"task_id": "task-42", "user_id": "u-1"}` with any enclosing
+   parent (none here), calls `_local_log_attrs.set(...)`, and stores the
+   returned token on the context object.
 
 3. `log.info("hello")` creates a `LogRecord` and propagates it up the
    logger tree to the root logger's handler.
 
-4. The root handler's filters run. `TaskContextFilter.filter(record)`
-   calls `_task_ctx.get()`, which (because we're inside the `with`)
-   returns `{"task_id": "task-42", "user_id": "u-1"}`. The filter writes
-   `record.service`, `record.task_id = "task-42"`,
-   `record.user_id = "u-1"`.
+4. The root handler's filters run. `TaskLogFilter.filter(record)` reads
+   `_local_log_attrs.get()` (`{"task_id": "task-42", "user_id": "u-1"}`),
+   writes `record.hostname` (auto), and merges `global_log_attrs` +
+   `local_log_attrs` onto the record copy as `record.service`,
+   `record.task_id`, `record.user_id`.
 
 5. `JsonFormatter.format(record)` reads all those attributes off the
    record and produces (key names mirror stdlib `LogRecord` attributes;
@@ -319,8 +333,8 @@ with task_context(task_id="task-42", user_id="u-1"):
    (Docker daemon / Kubernetes kubelet) captures it into its standard
    per-container log location.
 
-7. The `with` block exits. `_task_ctx.reset(token)` restores the prior
-   state. Any logs emitted after the block have `task_id: null`.
+7. The `with` block exits. `_local_log_attrs.reset(token)` restores the
+   prior state. Any logs emitted after the block carry no `task_id`.
 
 8. Alloy discovers the container via the Docker socket (or K8s API),
    tails its stdout, parses the JSON, ships it to Loki, and you query
@@ -333,18 +347,18 @@ with task_context(task_id="task-42", user_id="u-1"):
 | **Thread-local storage** (`threading.local`) | Doesn't work with `asyncio` — all coroutines on one event loop share a thread, so they'd share the same `task_id`. ContextVars work for both. |
 | **`logging.LoggerAdapter`** | Forces every log site to use a special logger object. Doesn't capture third-party libraries that call `logging.getLogger("urllib3")` themselves. |
 | **`extra={"task_id": ...}` on every call** | Same problem: every log site has to know to do it. Defeats the entire point of having implicit context. |
-| **`logging.setLogRecordFactory`** | Works, but is a process-global mutation that's hard to reverse and tests can't isolate cleanly. A per-handler filter is local and reversible (and `setup_logging` can replace its own handlers idempotently). |
+| **`logging.setLogRecordFactory`** | Works, but is a process-global mutation that's hard to reverse and tests can't isolate cleanly. A per-handler filter is local and reversible (and `setup_task_logging` can replace its own handlers idempotently). |
 | **Make `task_id` a Loki label** | Would crash Loki — Loki indexes by label combinations, and one stream per task is high-cardinality hell. `task_id` rides inside the JSON; Alloy promotes it to "structured metadata" so it stays queryable but unindexed. See [why-json-logs.md](why-json-logs.md). |
 
 ## TL;DR
 
 ```
-task_context()         →  contextvars.ContextVar.set/reset
+task_log_context()         →  contextvars.ContextVar.set/reset
                           (per-thread / per-asyncio-task storage with a
                            token-based stack, so nesting & restoration
                            just work, exception-safe by construction)
 
-TaskContextFilter      →  logging.Filter on the root handler that reads
+TaskLogFilter      →  logging.Filter on the root handler that reads
                           the ContextVar and stamps task_id and extras
                           onto every LogRecord — yours and third-party —
                           on its way out

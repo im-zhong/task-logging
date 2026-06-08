@@ -6,7 +6,7 @@
 
 Task-aware **structured logging** for distributed Python services.
 
-The library plugs into Python's stdlib `logging`, tags every record with a `task_id` (propagated automatically through threads and asyncio tasks), and writes JSON to **stdout**. The container runtime captures stdout, **Grafana Alloy** scrapes it, ships it to **Loki**, and you query it through **Grafana** with LogQL.
+The library plugs into Python's stdlib `logging`, lets you bind whatever per-request attrs you want (`task_id`, `user_id`, `trace_id`, …) so they propagate automatically through threads and asyncio tasks, and writes JSON to **stdout**. The container runtime captures stdout, **Grafana Alloy** scrapes it, ships it to **Loki**, and you query it through **Grafana** with LogQL.
 
 ```
 ┌────────────────┐    ┌────────────────┐    ┌────────────────┐
@@ -67,11 +67,13 @@ Requires **Python 3.12+**. The library has **zero runtime dependencies** beyond 
 
 ```python
 import logging
-from task_logging import setup_logging
+from task_logging import setup_task_logging
 
-setup_logging(
-    service="OrderService",                       # used as a Loki label
-    env="prod",
+setup_task_logging(
+    global_log_attrs={
+        "service": "OrderService",                # used as a Loki label
+        "env": "prod",
+    },
     level=logging.INFO,
     quiet_loggers={"urllib3": logging.WARNING},   # tame noisy libs
 )
@@ -97,10 +99,10 @@ log.info("service started")
 ### 3. Tag work with a `task_id`
 
 ```python
-from task_logging import task_context
+from task_logging import task_log_context
 
 def handle_request(req):
-    with task_context(task_id=req.id, user_id=req.user_id):
+    with task_log_context({"task_id": req.id, "user_id": req.user_id}):
         log.info("handling request")
         do_step_1()       # logs from here are tagged too
         do_step_2()
@@ -108,20 +110,19 @@ def handle_request(req):
         requests.get("https://api.x.com/v1/foo")
 ```
 
-`task_context()` uses Python `contextvars`, so it works correctly across **threads, `asyncio` tasks, and `concurrent.futures` executors** — each concurrent request gets its own isolated context.
+`task_log_context()` uses Python `contextvars`, so it works correctly across **threads, `asyncio` tasks, and `concurrent.futures` executors** — each concurrent request gets its own isolated context.
 
-If you don't pass `task_id`, a `uuid4` hex is generated for you.
+The library doesn't privilege any particular attr name. Pick whatever keys your domain wants — `task_id`, `request_id`, `trace_id`, `correlation_id` — they all ride through.
 
-If you can't use a `with` block (e.g. binding in middleware "before" / "after" hooks):
+If you can't use a `with` block (e.g. middleware that binds in a `before_request` hook and unbinds in `after_request`), the same instance also exposes `enter()` / `exit()`:
 
 ```python
-from task_logging import bind_task_context, unbind_task_context
+def before_request(req):
+    req.state.log_ctx = task_log_context({"task_id": req.id})
+    req.state.log_ctx.enter()
 
-token = bind_task_context(task_id=req.id)
-try:
-    handle()
-finally:
-    unbind_task_context(token)
+def after_request(req):
+    req.state.log_ctx.exit()
 ```
 
 ### 4. View it in Grafana
@@ -161,7 +162,7 @@ Every record is a single line of JSON with this stable shape. The keys mirror st
 }
 ```
 
-The first block mirrors stdlib LogRecord; the second block is fields we add (`service`, `env`, `hostname`, `task_id`, plus your `task_context` extras).
+The first block mirrors stdlib LogRecord; the second block is whatever you bound. Only `hostname` is auto-detected by the library — `service`, `env`, `task_id`, `user_id` are all yours, supplied via `setup_task_logging(global_log_attrs=...)` and `task_log_context({...})`.
 
 `exc_info` is `null` for normal records and an object for exceptions:
 
@@ -174,7 +175,7 @@ The first block mirrors stdlib LogRecord; the second block is fields we add (`se
 }
 ```
 
-`locals_dict` is a `repr()`-snapshot of the local variables at the deepest stack frame where the exception was raised — invaluable for post-mortem debugging. Disable it with `setup_logging(..., capture_locals=False)` if you're worried about secrets leaking into logs.
+`locals_dict` is a `repr()`-snapshot of the local variables at the deepest stack frame where the exception was raised — invaluable for post-mortem debugging. Disable it with `setup_task_logging(..., capture_locals=False)` if you're worried about secrets leaking into logs.
 
 ---
 
@@ -196,17 +197,17 @@ Same goes for raising inside a decorated function — see below.
 
 ---
 
-## The `@log_call` decorator
+## The `@log_func_call` decorator
 
-For zero-boilerplate enter / exit / timing logs, wrap any callable with `log_call`. It works on plain functions, instance methods, classmethods, staticmethods — anything — and imposes **no requirements on the surrounding class**.
+For zero-boilerplate enter / exit / timing logs, wrap any function with `log_func_call`. It works on plain functions, instance methods, classmethods, staticmethods — anything — and imposes **no requirements on the surrounding class**.
 
 ```python
 import logging
-from task_logging import log_call
+from task_logging import log_func_call
 
 log = logging.getLogger(__name__)
 
-@log_call(log)
+@log_func_call(log)
 def add(x: int, y: int) -> int:
     return x + y
 
@@ -220,7 +221,7 @@ It works on methods the same way — no `self._logger` attribute, no setup:
 
 ```python
 class Service:
-    @log_call(log)
+    @log_func_call(log)
     def handle(self, payload: dict) -> None:
         ...
 # Logs use the qualified name, so methods are easy to tell apart:
@@ -230,7 +231,7 @@ class Service:
 Omit the logger to auto-resolve `logging.getLogger(func.__module__)` — the stdlib "one logger per module" idiom:
 
 ```python
-@log_call()  # uses logging.getLogger(__name__) of the module the function lives in
+@log_func_call()  # uses logging.getLogger(func.__module__)
 def compute() -> int:
     ...
 ```
@@ -238,11 +239,11 @@ def compute() -> int:
 Override the level if you want:
 
 ```python
-@log_call(log, level=logging.DEBUG)
+@log_func_call(log, level=logging.DEBUG)
 def chatty(): ...
 ```
 
-If the wrapped callable raises, `log_call` emits a `RAISE` record (with full exception info: stack trace + locals) and re-raises:
+If the wrapped function raises, `log_func_call` emits a `RAISE` record (with full exception info: stack trace + locals) and re-raises:
 
 ```
 RAISE add after 0.142ms     (exc=ValueError: nope)
@@ -417,7 +418,7 @@ Add Loki as a Grafana data source (`http://loki:3100`), then explore:
 # JSON `levelname` field — see the Alloy config above)
 {env="prod", level=~"ERROR|CRITICAL"}
 
-# filter on a structured field bound via task_context(user_id=...)
+# filter on a structured field bound via task_log_context({"user_id": ...})
 {service="Billing"} | json | user_id="u-42"
 
 # filter on a stdlib LogRecord field after `| json`
@@ -437,26 +438,23 @@ In a Kubernetes cluster, replace `discovery.docker` with `discovery.kubernetes` 
 
 ```python
 from task_logging import (
-    setup_logging,        # call once at startup
-    task_context,         # `with task_context(task_id=...): ...`
-    bind_task_context,    # imperative version
-    unbind_task_context,
-    get_task_id,          # read the active task_id
-    get_task_context,     # read the full active context dict
-    log_call,             # decorator: ENTER / EXIT / RAISE for any callable
-    TaskContextFilter,    # the underlying logging.Filter
+    setup_task_logging,   # call once at startup
+    task_log_context,     # `with task_log_context({...}): ...`,
+                          # or imperative ctx.enter() / ctx.exit()
+    get_task_log_attrs,   # read the currently-active attrs (merged)
+    log_func_call,        # decorator: ENTER / EXIT / RAISE for a function
+    TaskLogFilter,        # the underlying logging.Filter
     JsonFormatter,        # the underlying logging.Formatter
 )
 ```
 
 | Symbol | Purpose |
 |---|---|
-| `setup_logging(service=..., env=..., level=..., ...)` | One-shot configuration of the root logger. Writes one JSON line per record to stdout. |
-| `task_context(task_id=..., **extra)` | Context manager that binds fields onto every log inside the block. |
-| `bind_task_context(**extra)` / `unbind_task_context(token)` | Imperative pair for non-`with` use. |
-| `get_task_id()` / `get_task_context()` | Read the currently active context. |
-| `log_call(logger=None, *, level=logging.INFO)` | Decorator that logs ENTER / EXIT / RAISE for the wrapped callable. `logger=None` auto-resolves to the function's module logger. |
-| `TaskContextFilter`, `JsonFormatter` | Exposed for advanced setups (e.g. attaching to a custom handler). |
+| `setup_task_logging(global_log_attrs=..., level=..., ...)` | One-shot configuration of the root logger. Writes one JSON line per record to stdout. |
+| `task_log_context(attrs)` | Bind a dict of attrs to the current execution context. Supports both `with task_log_context({...}):` and imperative `ctx.enter()` / `ctx.exit()`. |
+| `get_task_log_attrs()` | Return the currently-active merged attrs (empty dict if no context is active). |
+| `log_func_call(logger=None, *, level=logging.INFO)` | Decorator that logs ENTER / EXIT / RAISE for a function. `logger=None` auto-resolves to the function's module logger. |
+| `TaskLogFilter`, `JsonFormatter` | Exposed for advanced setups (e.g. attaching to a custom handler). |
 
 ---
 
@@ -464,24 +462,23 @@ from task_logging import (
 
 ```python
 import logging
-from task_logging import log_call, setup_logging, task_context
+from task_logging import log_func_call, setup_task_logging, task_log_context
 
-setup_logging(
-    service="Billing",
-    env="prod",
+setup_task_logging(
+    global_log_attrs={"service": "Billing", "env": "prod"},
     quiet_loggers={"urllib3": logging.WARNING, "botocore": logging.WARNING},
 )
 
 log = logging.getLogger(__name__)
 
 
-@log_call(log)
+@log_func_call(log)
 def charge(amount: float, currency: str) -> str:
     return f"charged {amount} {currency}"
 
 
 class Settlement:
-    @log_call(log, level=logging.DEBUG)
+    @log_func_call(log, level=logging.DEBUG)
     def settle(self, account: str) -> None:
         log.info("settling %s", account)
         try:
@@ -491,7 +488,7 @@ class Settlement:
 
 
 def handle_request(req):
-    with task_context(task_id=req.id, user_id=req.user_id):
+    with task_log_context({"task_id": req.id, "user_id": req.user_id}):
         charge(9.99, "USD")
         Settlement().settle("acct-1")
 ```
@@ -505,8 +502,8 @@ When this runs in a container, every line of stdout is JSON tagged with the requ
 - **`service` must be low-cardinality.** It becomes a Loki label. Use `"OrderService"`, never `"OrderService-pod-abc-7"`.
 - **`task_id` is per-request, never a label.** It rides inside the JSON payload. Loki ≥ 2.9 + `stage.structured_metadata` lets you filter on it efficiently.
 - **Exception capture only works inside `except` blocks.** The formatter reads `sys.exc_info()`, so call `log.exception(...)` while the exception is still being handled.
-- **Calling `setup_logging()` more than once is safe** — it removes its previous handlers before installing new ones, so tests / hot-reloads don't double-log.
-- **Disable locals capture in regulated environments.** Pass `capture_locals=False` to `setup_logging()` if `repr()` of arbitrary local variables could leak secrets.
+- **Calling `setup_task_logging()` more than once is safe** — it removes its previous handlers before installing new ones, so tests / hot-reloads don't double-log.
+- **Disable locals capture in regulated environments.** Pass `capture_locals=False` to `setup_task_logging()` if `repr()` of arbitrary local variables could leak secrets.
 - **What about loguru?** loguru is not based on stdlib `logging`, so libraries like `requests` and `urllib3` won't be captured by it. This package deliberately uses stdlib so third-party logs flow through the same pipeline. If you want loguru in your own code, use loguru's `InterceptHandler` to bridge stdlib → loguru — but this library does not require it.
 
 ---
@@ -515,8 +512,8 @@ When this runs in a container, every line of stdout is JSON tagged with the requ
 
 If you want a deeper mental model than this README provides, see [docs/](docs/):
 
-- [`docs/design/decorators.md`](docs/design/decorators.md) — why one `@log_call` instead of `FunctionLogger` + `ClassFunctionLogger`, and why classes don't need a `_logger` attribute
-- [`docs/design/task-context.md`](docs/design/task-context.md) — how `task_context` makes `task_id` flow through threads, asyncio tasks, and third-party libraries' logs
+- [`docs/design/decorators.md`](docs/design/decorators.md) — why one `@log_func_call` instead of `FunctionLogger` + `ClassFunctionLogger`, and why classes don't need a `_logger` attribute
+- [`docs/design/task-context.md`](docs/design/task-context.md) — how `task_log_context` makes log attrs flow through threads, asyncio tasks, and third-party libraries' logs
 - [`docs/design/stdlib-logging-primer.md`](docs/design/stdlib-logging-primer.md) — bottom-up tour of stdlib `logging` (LogRecord, the logger tree, handlers, filters, formatters) with the rules that prevent the most common pitfalls
 - [`docs/design/why-json-logs.md`](docs/design/why-json-logs.md) — Loki accepts arbitrary text; why does this library emit JSON anyway? What do we gain, and what do we trade away?
 - [`docs/design/json-schema.md`](docs/design/json-schema.md) — where the JSON keys come from, why we mirror stdlib LogRecord attribute names instead of inventing our own, and the stability promise

@@ -11,8 +11,8 @@ This `docs/` directory holds **design notes** that explain *why* the library is 
 
 | Note | Question it answers |
 |---|---|
-| [design/decorators.md](design/decorators.md) | Why is there only one `@log_call` decorator instead of separate `FunctionLogger` / `ClassFunctionLogger`? Why doesn't it require classes to have a `_logger` attribute? |
-| [design/task-context.md](design/task-context.md) | How does `task_context` make `task_id` flow through threads and asyncio tasks, and reach third-party libraries' logs without modifying them? |
+| [design/decorators.md](design/decorators.md) | Why is there only one `@log_func_call` decorator instead of separate `FunctionLogger` / `ClassFunctionLogger`? Why doesn't it require classes to have a `_logger` attribute? |
+| [design/task-context.md](design/task-context.md) | How does `task_log_context` make user-supplied attrs flow through threads, asyncio tasks, and third-party libraries' logs without modifying them? |
 | [design/stdlib-logging-primer.md](design/stdlib-logging-primer.md) | A bottom-up tour of stdlib `logging` — `LogRecord`, the logger tree, handlers, filters, formatters — with the rules that prevent the most common pitfalls. |
 | [design/why-json-logs.md](design/why-json-logs.md) | Loki accepts arbitrary text; why does this library emit JSON anyway? What do we gain, and what do we trade away? |
 | [design/json-schema.md](design/json-schema.md) | Where do the JSON keys (`ts`, `level`, `logger`, `msg`, `service`, `task_id`, …) come from? What was renamed, what was dropped, and what's the stability promise? |

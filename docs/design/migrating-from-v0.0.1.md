@@ -19,22 +19,22 @@ isn't just an opaque rewrite).
 
 | Old: bound to `TaskLogger` instance | New: where it lives |
 |---|---|
-| `service_name` | `setup_logging(service=...)` — process-wide, set once at startup |
-| `task_id` | `task_context(task_id=...)` — per-request, flows via `contextvars` |
-| every other field (hostname, exc_info, frame info, …) | `TaskContextFilter` + stdlib's auto-populated `LogRecord` attributes |
+| `service_name` | `setup_task_logging(global_log_attrs={"service": ...})` — process-wide, set once at startup |
+| `task_id` | `task_log_context({"task_id": ...})` — per-request, flows via `contextvars` |
+| every other field (hostname, exc_info, frame info, …) | `TaskLogFilter` + stdlib's auto-populated `LogRecord` attributes |
 
 The combination — not any single one of them — replaces what
-`TaskLogger` did. `task_context` alone is **not** a drop-in for
-`TaskLogger`; you also need `setup_logging` running and the filter
+`TaskLogger` did. `task_log_context` alone is **not** a drop-in for
+`TaskLogger`; you also need `setup_task_logging` running and the filter
 attached.
 
 ## Capability-by-capability mapping
 
 | Old `TaskLogger` did | Now done by | Notes |
 |---|---|---|
-| Bind `service_name` to the logger | `TaskContextFilter` (set at `setup_logging` time) | `service` is process-wide; it belongs to one-time setup, not per-call. |
-| Bind `task_id` to the logger | `contextvars` + `task_context()` | `task_id` is per-request and now flows through threads / asyncio tasks automatically. See [task-context.md](task-context.md). |
-| Capture `hostname` | `TaskContextFilter` (cached at module import) | Same — was always per-process. |
+| Bind `service_name` to the logger | `TaskLogFilter` (set at `setup_task_logging` time) | `service` is process-wide; it belongs to one-time setup, not per-call. |
+| Bind `task_id` to the logger | `contextvars` + `task_log_context()` | `task_id` is per-request and now flows through threads / asyncio tasks automatically. See [task-context.md](task-context.md). |
+| Capture `hostname` | `TaskLogFilter` (cached at module import) | Same — was always per-process. |
 | Capture `process_id` | stdlib auto-populates `record.process` | We don't even have to set it. |
 | Capture `thread_name` / `thread_id` | stdlib auto-populates `record.threadName` / `record.thread` | Free from stdlib. |
 | Capture `filename` / `module_name` / `function_name` / `line_no` (via `inspect.stack()` walk) | stdlib auto-populates `record.pathname` / `record.module` / `record.funcName` / `record.lineno` | The biggest improvement — see "Why this is better" below. |
@@ -136,7 +136,7 @@ class StackDepthFilter(logging.Filter):
         record.stack_depth = len(inspect.stack())
         return True
 
-setup_logging(service="...")
+setup_task_logging()
 logging.getLogger().handlers[0].addFilter(StackDepthFilter())
 ```
 
@@ -159,26 +159,30 @@ def handle_request(req):
 
 ```python
 # After
-setup_logging(service="OrderService", env="prod")  # once at startup
+setup_task_logging(
+    global_log_attrs={"service": "OrderService", "env": "prod"},
+)
 
 log = logging.getLogger(__name__)
 
 def handle_request(req):
-    with task_context(task_id=req.id):
+    with task_log_context({"task_id": req.id}):
         log.info("handling request")
         requests.get("https://api.x.com")  # ← is now tagged
 ```
 
 Three differences worth pointing out:
 
-1. **Setup is global, not per-task.** `setup_logging` runs once at
+1. **Setup is global, not per-task.** `setup_task_logging` runs once at
    process startup. There's no factory, no per-task logger instance.
 2. **Use module loggers, not service loggers.** Replace
    `factory.new(service_name=...)` with the stdlib idiom
    `logging.getLogger(__name__)`. The `service` field is still on every
-   record — it's now stamped by the filter, not bound to the logger.
+   record — it's now stamped by the filter from `global_log_attrs`,
+   not bound to the logger.
 3. **`task_id` is a context, not an arg.** Wrap each request in
-   `with task_context(task_id=req.id):` (or use `bind_task_context` /
-   `unbind_task_context` for non-`with` lifetimes). Logs *anywhere*
-   inside the block — yours, third-party libs, decorated functions —
-   get tagged automatically.
+   `with task_log_context({"task_id": req.id}):`, or use the imperative
+   form (`ctx = task_log_context({...}); ctx.enter() / ctx.exit()`) for
+   middleware that splits enter/exit across separate hook callbacks.
+   Logs *anywhere* inside the active context — yours, third-party libs,
+   decorated functions — get tagged automatically.

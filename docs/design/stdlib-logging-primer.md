@@ -85,7 +85,7 @@ be emitted.
 
 **You can stick anything onto a record.** It's a plain object. Filters
 routinely do `record.task_id = "..."` to enrich the record before it
-reaches the handler. That's exactly what `TaskContextFilter` does.
+reaches the handler. That's exactly what `TaskLogFilter` does.
 
 ## 2. `Logger` — a named node in a tree
 
@@ -143,14 +143,14 @@ all. It uses **effective level**: walk up the tree until you find a
 logger with a level set; that's your threshold.
 
 ```
-root.level         = WARNING   ← set by setup_logging
+root.level         = WARNING   ← set by setup_task_logging
 "myapp".level      = NOTSET    (inherit)
 "myapp.db".level   = DEBUG     ← explicitly set
 "myapp.db.pool"    = NOTSET    (inherit "myapp.db" → DEBUG)
 ```
 
 So `myapp.db.pool` effectively logs at DEBUG. This is the mechanism
-behind `setup_logging(quiet_loggers={"urllib3": logging.WARNING})`: we
+behind `setup_task_logging(quiet_loggers={"urllib3": logging.WARNING})`: we
 set the level on the `urllib3` logger so all of `urllib3.connectionpool`,
 `urllib3.util`, etc. inherit it.
 
@@ -253,17 +253,17 @@ The interesting use of filters is **enrichment**, not filtering. Inside
 `filter()`, before returning `True`, you mutate the record:
 
 ```python
-class TaskContextFilter(logging.Filter):
+class TaskLogFilter(logging.Filter):
     def filter(self, record):
-        record.task_id  = get_task_id()    # contextvar lookup
-        record.service  = self._service
         record.hostname = _HOSTNAME
+        for key, value in get_task_log_attrs().items():    # contextvar lookup
+            setattr(record, key, value)
         return True   # never drop
 ```
 
-Now any handler whose formatter knows about `record.task_id` will print
-it. This is the canonical stdlib pattern for "I want to add a field to
-every log line."
+Now any handler whose formatter walks `record.__dict__` will see those
+fields. This is the canonical stdlib pattern for "I want to add a field
+to every log line."
 
 ### The asymmetry between logger-filters and handler-filters
 
@@ -277,7 +277,7 @@ This trips people up.
 - **Handler-filters run on every record that reaches the handler**,
   no matter which logger originally emitted it.
 
-That asymmetry is exactly why `task_logging` puts `TaskContextFilter` on
+That asymmetry is exactly why `task_logging` puts `TaskLogFilter` on
 the *handler*, not on a logger:
 
 ```python
@@ -309,16 +309,16 @@ Two methods worth knowing:
 - `formatter.formatTime(record, datefmt)` — formats `record.created` as a
   timestamp
 
-## Putting it together: what `setup_logging` actually does
+## Putting it together: what `setup_task_logging` actually does
 
 Now you can read the whole flow without surprise:
 
 ```python
-def setup_logging(*, service, env=None, level=INFO, ...):
+def setup_task_logging(*, global_log_attrs=None, level=INFO, ...):
     root = logging.getLogger()                # the tree's root
     root.setLevel(level)                      # global threshold
 
-    ctx_filter = TaskContextFilter(service, env)
+    ctx_filter = TaskLogFilter(global_log_attrs=global_log_attrs)
     formatter  = JsonFormatter()
 
     handler = StreamHandler(sys.stdout)       # one handler, stdout
@@ -336,7 +336,7 @@ When `urllib3.connectionpool` later does `log.warning("retrying")`:
    handlers) → `urllib3` (no handlers) → root (has our stdout handler).
 4. The handler:
    - Check handler level (default NOTSET → pass)
-   - Run handler filters: `TaskContextFilter` runs, stamps
+   - Run handler filters: `TaskLogFilter` runs, stamps
      `record.task_id = current_task_id_from_contextvar`, returns `True`
    - Format: `JsonFormatter.format(record)` reads the freshly-stamped
      fields and emits a JSON line

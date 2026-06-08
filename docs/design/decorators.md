@@ -1,9 +1,9 @@
-# Why one `@log_call`, not two decorators
+# Why one `@log_func_call`, not two decorators
 
 > Earlier the library exposed `FunctionLogger` for free functions and
 > `ClassFunctionLogger` for instance methods. The latter required the class
 > to expose a `self._logger` attribute, and silently no-op'd if the attribute
-> was missing. We now expose a single `@log_call` instead.
+> was missing. We now expose a single `@log_func_call` instead.
 
 ## What changed
 
@@ -24,11 +24,11 @@ class Service:
 
 ```python
 class Service:
-    @log_call(log)                                   # no class-level setup
+    @log_func_call(log)                                   # no class-level setup
     def handle(self, payload): ...
 ```
 
-`@log_call(logger=None, *, level=logging.INFO)` is the single decorator. It
+`@log_func_call(logger=None, *, level=logging.INFO)` is the single decorator. It
 works on functions, instance methods, classmethods, and staticmethods alike.
 
 ## Why the old split existed
@@ -51,7 +51,7 @@ That was the entire reason it existed.
 The contextvars-based rewrite changed the load-bearing assumption:
 
 - `task_id` no longer lives on the logger. It flows through `contextvars`,
-  attached at log-emission time by `TaskContextFilter` regardless of which
+  attached at log-emission time by `TaskLogFilter` regardless of which
   logger you use.
 - All loggers in a process share the same handler tree. The stdlib idiom
   `logging.getLogger(__name__)` gives you a logger per module for free.
@@ -69,17 +69,17 @@ without any technical payoff*:
 - It forces users to think about "which classes have a logger and which
   don't," for no payoff.
 
-## Why a single `log_call` is enough
+## Why a single `log_func_call` is enough
 
-`log_call` takes the logger explicitly at decoration time, with optional
+`log_func_call` takes the logger explicitly at decoration time, with optional
 auto-resolution to `logging.getLogger(func.__module__)` when omitted. That
 covers every case the old two-class API covered, plus more:
 
 | Use case | Old API | New API |
 |---|---|---|
-| Free function | `FunctionLogger(log).log_func()` | `@log_call(log)` |
-| Instance method | `ClassFunctionLogger().log_func()` + `self._logger` | `@log_call(log)` |
-| Use the module's logger automatically | not supported | `@log_call()` |
+| Free function | `FunctionLogger(log).log_func()` | `@log_func_call(log)` |
+| Instance method | `ClassFunctionLogger().log_func()` + `self._logger` | `@log_func_call(log)` |
+| Use the module's logger automatically | not supported | `@log_func_call()` |
 | Per-instance logger (different loggers per object) | `ClassFunctionLogger(logger_attr=...)` | not supported (and that's fine — see below) |
 
 ### What about per-instance loggers?
@@ -91,18 +91,18 @@ We dropped that because:
 1. It's a feature solving a problem almost nobody has.
 2. The legitimate version of "different instances write different things"
    is *different log content / context*, which is exactly what
-   `task_context()` solves — at the per-call level, not per-instance.
+   `task_log_context` solves — at the per-call level, not per-instance.
 3. `__qualname__` in log messages already gives you `Service.handle` so
    you can tell methods on different classes apart in the logs.
 
 If you genuinely need per-instance routing, pass the logger to
-`__init__` and do `@log_call(self._logger)` — except you can't, because
+`__init__` and do `@log_func_call(self._logger)` — except you can't, because
 decorators bind at class-definition time, before `self` exists. That
 constraint is fundamental, not specific to our decorator. The honest
 answer is: you'd build the routing inside the method body, not the
 decorator.
 
-## What `log_call` does emit
+## What `log_func_call` does emit
 
 ```
 ENTER <qualname> args=... kwargs=...
@@ -125,7 +125,7 @@ Three design choices worth flagging:
   empty or absent.
 
 - **RAISE always uses `logger.exception(...)`,** not the level you passed
-  to `log_call`. An unhandled exception escaping a function is by
+  to `log_func_call`. An unhandled exception escaping a function is by
   definition exceptional; it should not be filed at DEBUG even if you
   configured DEBUG-level entry/exit logs.
 
@@ -141,7 +141,7 @@ func_log = FunctionLogger(logger=log)
 def add(x, y): ...
 
 # after
-@log_call(log)
+@log_func_call(log)
 def add(x, y): ...
 ```
 
@@ -157,7 +157,7 @@ class Service:
 
 # after
 class Service:
-    @log_call(log)
+    @log_func_call(log)
     def handle(self): ...
 ```
 

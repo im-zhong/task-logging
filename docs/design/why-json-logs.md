@@ -171,7 +171,7 @@ To be honest about the tradeoffs:
 
 ## Why one format, not two
 
-Earlier versions of `setup_logging` shipped a second "human-readable"
+Earlier versions of `setup_task_logging` shipped a second "human-readable"
 formatter that engaged automatically when stdout was a TTY. We removed
 it. The reasons:
 
