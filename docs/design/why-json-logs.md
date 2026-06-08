@@ -58,22 +58,30 @@ In the Alloy config in our README:
 ```alloy
 loki.process "parse" {
   stage.json {
-    expressions = { level = "level", ts = "ts", task_id = "task_id" }
+    expressions = {
+      level   = "levelname",  // pull stdlib's `levelname` field out as `level`
+      created = "created",    // Unix float timestamp
+      task_id = "task_id",
+    }
   }
-  stage.timestamp { source = "ts" format = "RFC3339Nano" }
+  stage.timestamp { source = "created" format = "Unix" }
   stage.labels   { values = { level = "" } }
   stage.structured_metadata { values = { task_id = "" } }
 }
 ```
 
-That config takes a JSON line and:
+That config takes a JSON line (whose keys mirror stdlib `LogRecord`
+attribute names — see [json-schema.md](json-schema.md)) and:
 
-- Promotes `level` to a Loki **label** (cheap, indexed) — so
-  `{level="ERROR"}` is fast.
+- Promotes the JSON `levelname` field to a Loki **label** named `level`
+  (cheap, indexed) — so `{level="ERROR"}` queries are fast. The Loki
+  label name is independent of the JSON field name; we keep `level`
+  for query ergonomics.
 - Pushes `task_id` into Loki **structured metadata** (filterable but not
   indexed) — high-cardinality task IDs don't blow up Loki's stream count,
   yet you can still filter by them quickly.
-- Uses your application's `ts` as the canonical timestamp instead of
+- Uses the application's `created` timestamp (Unix float, from
+  stdlib's `LogRecord.created`) as the canonical timestamp instead of
   "the time Alloy happened to read the line" — which matters when there's
   lag between writing and shipping.
 
@@ -103,7 +111,7 @@ your retention is.
 Look at what the formatter actually emits for an exception:
 
 ```json
-"exc": {
+"exc_info": {
   "name": "ZeroDivisionError",
   "details": "division by zero",
   "stack_trace": "Traceback (most recent call last):\n  File ...",
@@ -117,7 +125,7 @@ unreadable mess? You'd either:
 - Spread it across multiple lines (now Alloy needs `stage.multiline` —
   gnarly).
 - Encode it inline somehow (which is just JSON with extra steps).
-- Drop the structure (and lose the ability to query `exc.name="ValueError"`).
+- Drop the structure (and lose the ability to query `exc_info.name="ValueError"`).
 
 JSON handles nested structure natively. One line, one record, queryable
 shape.
@@ -128,7 +136,7 @@ This is the soft reason but probably the most important one:
 
 > JSON is a contract. Plain text is a habit.
 
-When the log line is `{"level":"INFO","msg":"...","task_id":"..."}`, every
+When the log line is `{"levelname":"INFO","message":"...","task_id":"..."}`, every
 consumer — Alloy, an ad-hoc `jq` pipeline, a one-off Python script that
 greps archived logs, a Grafana dashboard, a Splunk sidecar somebody adds
 three years from now — agrees on what the fields are. When the line is

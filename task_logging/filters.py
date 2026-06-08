@@ -20,14 +20,15 @@ See docs/design/stdlib-logging-primer.md (§4) for the full reasoning.
 from __future__ import annotations
 
 import logging
-import os
 import socket
 from typing import Any
 
 from .context import get_task_context
 
+# Cached at module import. hostname is effectively immutable for the life
+# of the process; PID we don't need to stamp because stdlib already sets
+# `record.process` for us.
 _HOSTNAME = socket.gethostname()
-_PID = os.getpid()
 
 
 class TaskContextFilter(logging.Filter):
@@ -35,11 +36,11 @@ class TaskContextFilter(logging.Filter):
 
     The filter never drops records (always returns True). It only enriches.
 
-    Fields written onto the record:
+    Fields written onto the record (all NEW — none of these exist on a
+    stock LogRecord; PID/process info comes from stdlib's record.process):
         - `service`:  the service name passed to `setup_logging`
         - `env`:      the environment name (e.g. "prod", "dev"); may be None
         - `hostname`: the machine hostname
-        - `pid`:      the process id
         - `task_id`:  the current task id, or None
         - plus every extra field bound via `task_context(**extra)`
     """
@@ -53,14 +54,13 @@ class TaskContextFilter(logging.Filter):
         self._extra: dict[str, Any] = dict(extra) if extra else {}
 
     def filter(self, record: logging.LogRecord) -> bool:
-        # Static fields known at setup time — service identity and process
-        # identity. Stamping them here (rather than in the formatter) keeps
-        # the formatter purely transport-layer and makes record introspection
-        # in tests / other handlers see the enriched record too.
+        # Static fields known at setup time. We deliberately do NOT set
+        # record.pid — stdlib already populates record.process with the PID,
+        # and adding our own duplicate field under a different name would
+        # contradict the principle "JSON keys mirror LogRecord names."
         record.service = self._service
         record.env = self._env
         record.hostname = _HOSTNAME
-        record.pid = _PID
 
         # Pull whatever the active task_context() bound. ContextVar lookup is
         # cheap (a dict get on a per-thread/task variable); doing it on every
@@ -112,7 +112,6 @@ _RESERVED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
         "service",
         "env",
         "hostname",
-        "pid",
         "task_id",
     }
 )

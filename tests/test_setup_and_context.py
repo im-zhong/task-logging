@@ -49,13 +49,14 @@ def test_setup_logging_writes_json_with_service_and_hostname(buf: io.StringIO) -
 
     [record] = _read_json_lines(buf)
     assert record["service"] == "OrderService"
-    assert record["msg"] == "order created"
-    assert record["level"] == "INFO"
-    assert record["logger"] == "biz"
+    assert record["message"] == "order created"
+    assert record["levelname"] == "INFO"
+    assert record["name"] == "biz"
     assert record["task_id"] is None
     assert record["hostname"]
-    assert record["pid"] > 0
-    assert record["exc"] is None
+    # `process` comes from stdlib LogRecord.process, not from us.
+    assert record["process"] > 0
+    assert record["exc_info"] is None
 
 
 def test_task_context_propagates_task_id(buf: io.StringIO) -> None:
@@ -122,7 +123,7 @@ def test_third_party_logger_inherits_context(buf: io.StringIO) -> None:
         third_party.warning("Retrying (Retry(total=2))")
 
     [record] = _read_json_lines(buf)
-    assert record["logger"] == "urllib3.connectionpool"
+    assert record["name"] == "urllib3.connectionpool"
     assert record["task_id"] == "t-99"
     assert record["service"] == "svc"
 
@@ -140,7 +141,7 @@ def test_exception_is_captured_with_locals(buf: io.StringIO) -> None:
         log.exception("division failed")
 
     [record] = _read_json_lines(buf)
-    exc = record["exc"]
+    exc = record["exc_info"]
     assert exc is not None
     assert exc["name"] == "ZeroDivisionError"
     assert exc["details"] == "division by zero"
@@ -158,7 +159,7 @@ def test_capture_locals_can_be_disabled(buf: io.StringIO) -> None:
         log.exception("oops")
 
     [record] = _read_json_lines(buf)
-    assert record["exc"]["locals_dict"] == {}
+    assert record["exc_info"]["locals_dict"] == {}
 
 
 def test_quiet_loggers_are_silenced(buf: io.StringIO) -> None:
@@ -174,7 +175,7 @@ def test_quiet_loggers_are_silenced(buf: io.StringIO) -> None:
     chatty.warning("should pass")
 
     [record] = _read_json_lines(buf)
-    assert record["msg"] == "should pass"
+    assert record["message"] == "should pass"
 
 
 def test_output_is_always_json_even_for_a_tty_like_stream() -> None:
@@ -190,7 +191,7 @@ def test_output_is_always_json_even_for_a_tty_like_stream() -> None:
     output = fake.getvalue()
     assert output.strip().startswith("{")  # JSON, regardless of TTY status
     record = json.loads(output)
-    assert record["msg"] == "hello"
+    assert record["message"] == "hello"
 
 
 def test_log_call_emits_enter_and_exit(buf: io.StringIO) -> None:
@@ -203,7 +204,7 @@ def test_log_call_emits_enter_and_exit(buf: io.StringIO) -> None:
 
     assert add(2, 3) == 5
 
-    msgs = [r["msg"] for r in _read_json_lines(buf)]
+    msgs = [r["message"] for r in _read_json_lines(buf)]
     assert msgs[0].startswith("ENTER")
     assert "add" in msgs[0]
     assert msgs[1].startswith("EXIT")
@@ -222,12 +223,16 @@ def test_log_call_logs_exception_and_reraises(buf: io.StringIO) -> None:
         boom()
 
     records = _read_json_lines(buf)
-    assert any(r["msg"].startswith("ENTER") and "boom" in r["msg"] for r in records)
+    assert any(
+        r["message"].startswith("ENTER") and "boom" in r["message"] for r in records
+    )
     raise_records = [
-        r for r in records if r["msg"].startswith("RAISE") and "boom" in r["msg"]
+        r
+        for r in records
+        if r["message"].startswith("RAISE") and "boom" in r["message"]
     ]
     assert len(raise_records) == 1
-    assert raise_records[0]["exc"]["name"] == "ValueError"
+    assert raise_records[0]["exc_info"]["name"] == "ValueError"
 
 
 def test_log_call_decorates_a_method_without_any_class_setup(
@@ -245,10 +250,10 @@ def test_log_call_decorates_a_method_without_any_class_setup(
     assert Service().handle(7) == 14
 
     records = _read_json_lines(buf)
-    assert records[0]["logger"] == "biz.service"
+    assert records[0]["name"] == "biz.service"
     # qualname includes the class, so we can tell methods from functions in logs.
-    assert "Service.handle" in records[0]["msg"]
-    assert "return=14" in records[1]["msg"]
+    assert "Service.handle" in records[0]["message"]
+    assert "return=14" in records[1]["message"]
 
 
 def test_log_call_auto_resolves_logger_from_module(buf: io.StringIO) -> None:
@@ -263,8 +268,8 @@ def test_log_call_auto_resolves_logger_from_module(buf: io.StringIO) -> None:
 
     records = _read_json_lines(buf)
     # The decorated function lives in this test module, so its logger should too.
-    assert records[0]["logger"] == compute.__module__
-    assert records[0]["logger"] == __name__
+    assert records[0]["name"] == compute.__module__
+    assert records[0]["name"] == __name__
 
 
 def test_log_call_respects_custom_level(buf: io.StringIO) -> None:
@@ -277,7 +282,7 @@ def test_log_call_respects_custom_level(buf: io.StringIO) -> None:
 
     step()
     records = _read_json_lines(buf)
-    assert all(r["level"] == "DEBUG" for r in records)
+    assert all(r["levelname"] == "DEBUG" for r in records)
 
 
 def test_context_isolated_across_threads(buf: io.StringIO) -> None:

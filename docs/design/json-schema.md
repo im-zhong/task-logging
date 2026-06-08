@@ -1,14 +1,21 @@
 # Where the JSON keys come from
 
-> The `JsonFormatter` docstring lists keys like `ts`, `level`, `logger`,
-> `msg`, `service`, `task_id`, `func`, `file`, `line`, `exc`, … Where do
-> those names come from? Is there a standard?
+> The `JsonFormatter` emits keys like `created`, `levelname`, `name`,
+> `message`, `pathname`, `funcName`, `lineno`, `process`, `thread`,
+> `threadName`, `module`, `exc_info`, plus our own `service`, `env`,
+> `hostname`, `task_id`, and any extras. Where do those names come from?
+> Is there a standard?
 
-Short answer: there's no standard the formatter is conforming to. The keys
-were **picked**, with a loose lean toward the OpenTelemetry log data model.
-This note records exactly where each key came from, what was renamed, what
-was dropped, and why — so future contributors and curious users have
-something to consult before proposing schema changes.
+Short answer: **the keys mirror stdlib `LogRecord` attribute names
+exactly**, plus a small handful of fields we invented that don't exist
+on a `LogRecord` (`service`, `env`, `hostname`, `task_id`, plus your
+`task_context` extras). The stdlib reference is *also* the JSON schema
+reference:
+
+- https://docs.python.org/3/library/logging.html#logrecord-attributes
+
+This note records why we made that choice, the per-key origin tables,
+and the stability promise.
 
 ## The pipeline
 
@@ -18,128 +25,157 @@ There are three "sources" feeding the JSON payload:
 LogRecord (built by stdlib logging, ~25 attrs)
     │
     ▼
-TaskContextFilter  →  adds: service, env, hostname, pid, task_id,
+TaskContextFilter  →  adds: service, env, hostname, task_id,
     │                       *task_context extras*
     ▼
-JsonFormatter      →  picks which to keep, what to call them, what to drop
-    │
+JsonFormatter      →  picks which to keep, drops the redundant ones,
+    │                 keeps stdlib names verbatim
     ▼
-JSON payload {ts, level, logger, msg, service, ...}
+JSON payload {created, levelname, name, message, ...}
 ```
 
-Every key in the JSON falls into one of six groups below.
+Every key in the JSON falls into one of four groups below.
 
-## Group 1: renamed from stdlib `LogRecord`
+## Group 1: stdlib `LogRecord` attributes, kept verbatim
 
-stdlib gives us attributes with names that are slightly awkward in JSON
-(camelCase mixed with weird abbreviations). Several were renamed:
+| JSON key | stdlib `LogRecord` attribute |
+|---|---|
+| `created` | `record.created` (Unix timestamp as float) |
+| `levelname` | `record.levelname` (`"INFO"`, `"ERROR"`, …) |
+| `name` | `record.name` (the logger name) |
+| `message` | `record.getMessage()` (the formatted message) |
+| `process` | `record.process` (PID) |
+| `thread` | `record.thread` (thread id) |
+| `threadName` | `record.threadName` |
+| `module` | `record.module` |
+| `funcName` | `record.funcName` |
+| `pathname` | `record.pathname` (full file path) |
+| `lineno` | `record.lineno` |
+| `exc_info` | rendered from `record.exc_info` (see Group 3) |
 
-| JSON key | stdlib `LogRecord` attribute | Why renamed |
-|---|---|---|
-| `ts` | `record.created` (a `time.time()` float) | "ts" is the de-facto name for log timestamps in Grafana / Loki / OTel / Datadog. We also convert the float into an ISO-8601 string with the formatter; it's no longer just the raw `created` value. |
-| `level` | `record.levelname` | Drop the redundant "name" suffix. Everyone calls this "level." |
-| `logger` | `record.name` | "name" alone is ambiguous (whose name?). "logger" makes it self-describing. |
-| `msg` | `record.getMessage()` (NOT `record.msg`) | `record.msg` is the *format string*; `getMessage()` is the formatted result. We emit the formatted result and call it `msg` because that's the colloquial term. |
-| `func` | `record.funcName` | Shorter, equally clear. |
-| `file` | `record.pathname` | "pathname" is jargon; "file" is what humans say. |
-| `line` | `record.lineno` | Strip the redundant "no." |
-| `thread_name` | `record.threadName` | Snake_case-ify camelCase to match the rest of the JSON. |
+No renames. If you've ever read [the LogRecord
+docs](https://docs.python.org/3/library/logging.html#logrecord-attributes),
+you already know the schema. The JSON spelling for `funcName` is
+`funcName` (camelCase), not `func_name` (snake_case), because that's
+what stdlib calls it — picking a different spelling would just create a
+parallel naming convention readers have to memorise.
 
-## Group 2: copied verbatim from `LogRecord`
+## Group 2: added by `TaskContextFilter`
 
-| JSON key | stdlib attribute | Why kept |
-|---|---|---|
-| `thread` | `record.thread` | Thread *id* (an int). Already short and common. |
-| `module` | `record.module` | Already a fine name. |
-
-## Group 3: added by `TaskContextFilter`
-
-These don't exist on a stock `LogRecord`. The filter writes them on, and
-the formatter reads them back off:
+These don't exist on a stock `LogRecord`. The filter writes them onto
+the record, and the formatter reads them back off:
 
 | JSON key | Source | Why this name |
 |---|---|---|
-| `service` | the `service=` arg to `setup_logging` | "service" is the standard term in microservice telemetry (Datadog, OTel, Grafana docs all use it). |
+| `service` | the `service=` arg to `setup_logging` | Standard term in microservice telemetry (Datadog, OTel, Grafana docs all use it). |
 | `env` | the `env=` arg | Standard in deployment contexts ("prod", "staging", "dev"). |
-| `hostname` | `socket.gethostname()` | Self-explanatory. |
-| `pid` | `os.getpid()` | "pid" is universal; "process_id" felt verbose. |
-| `task_id` | `contextvars` lookup via `get_task_id()` | This is the library's own concept. Kept "task_id" because that's what the rest of the API (`task_context(task_id=...)`, `get_task_id()`) calls it. |
+| `hostname` | `socket.gethostname()` | Self-explanatory. There's no `record.hostname` in stdlib — it's our concept. |
+| `task_id` | `contextvars` lookup via `get_task_id()` | The library's own concept. Kept "task_id" because that's what the rest of the API (`task_context(task_id=...)`, `get_task_id()`) calls it. |
 
-## Group 4: rendered by the formatter itself
+Note we deliberately do NOT add a `pid` field. Stdlib already populates
+`record.process`, which becomes the JSON `process` key — duplicating it
+under a second name would contradict "JSON keys mirror LogRecord."
+
+## Group 3: rendered by the formatter itself
 
 | JSON key | What it is |
 |---|---|
-| `exc` | A nested object built by `_render_exc_info()` from `record.exc_info`. Always present — `null` if there was no exception, or `{name, details, stack_trace, locals_dict}` if there was. |
+| `exc_info` | A nested object built by `_render_exc_info()` from `record.exc_info`. Always present — `null` if there was no exception, or `{name, details, stack_trace, locals_dict}` if there was. The KEY name (`exc_info`) matches the stdlib LogRecord attribute it derives from; only the *value shape* is ours. |
 
-## Group 5: open-ended user extras
+## Group 4: open-ended user extras
 
 | JSON key | Source |
 |---|---|
 | `user_id`, `request_id`, `region`, … | Whatever you passed to `task_context(**extra)` or `static_fields=` in `setup_logging`. The formatter walks `record.__dict__` and emits anything that isn't a built-in `LogRecord` attribute. |
 
-That's why the docstring lists them as `...: any extra fields you bound`.
+These are user-defined; we don't control their casing.
 
-## Group 6: stdlib attributes deliberately *dropped*
+## Group 5: stdlib attributes deliberately *dropped*
 
-Worth being explicit about what's NOT in the payload, because the ones we
-kept were a curation, not a copy:
+Worth being explicit about what's NOT in the payload, because we curated
+which stdlib fields to keep:
 
 | Dropped | Why |
 |---|---|
-| `record.args`, `record.msg` (raw) | Already substituted into `msg` via `getMessage()`. Keeping the format string + args in JSON would be redundant and inflate line size. |
-| `record.created` (raw float), `record.msecs`, `record.relativeCreated`, `record.asctime` | All redundant with the ISO `ts`. |
-| `record.levelno` | Redundant with `levelname`. Filtering by `level=ERROR` is sufficient; few queries need the integer. |
-| `record.exc_text`, `record.stack_info` | Already encoded inside `exc.stack_trace`. |
+| `record.args`, `record.msg` (raw) | Already substituted into `message` via `getMessage()`. Keeping the format string + args in JSON would be redundant and inflate line size. |
+| `record.msecs`, `record.relativeCreated`, `record.asctime` | All redundant with the float `created` (`stage.timestamp` parses it to whatever Loki wants). |
+| `record.levelno` | Redundant with `levelname`. Filtering by `levelname=ERROR` is sufficient; few queries need the integer. |
+| `record.exc_text`, `record.stack_info` | Already encoded inside `exc_info.stack_trace`. |
 | `record.processName` | Almost always `"MainProcess"`. Useless noise. |
 | `record.taskName` (Python 3.12+) | Asyncio task name, conflicts with our `task_id` semantically (different concept) — emitting both would be confusing. |
-| `record.filename` | Redundant with `pathname` (which we kept as `file`). `filename` is just the basename. |
+| `record.filename` | Redundant with `pathname`. `filename` is just the basename. |
 
 The curation optimises for "useful in Loki, queryable in LogQL, doesn't
-waste bytes" — everything redundant got dropped.
+waste bytes" — everything redundant or noisy got dropped.
 
-## What we're loosely following
+## Why mirror stdlib names?
 
-The schema isn't strictly conforming to any one specification, but it
-leans toward **OpenTelemetry's log data model**, which has converged
-enough that most modern logging tools recognise it:
+We previously renamed several keys (`level`, `logger`, `msg`, `func`,
+`file`, `line`, `ts`, `thread_name`, …) for "JSON niceness." That was
+backed out, for these reasons:
+
+1. **Two naming conventions, one library.** Anyone reading the source
+   sees `record.levelname` / `record.funcName`; anyone reading the JSON
+   saw `level` / `func`. People had to learn the mapping. Now there is
+   no mapping.
+
+2. **Stdlib is the spec.** Python's `LogRecord` documentation page is
+   stable, comprehensive, and not going anywhere. Every Python
+   programmer either already knows it or knows where to find it. Using
+   those names for free buys us a real spec without writing one.
+
+3. **No "JSON niceness" payoff.** The JSON consumer (Alloy / Grafana /
+   `jq` / a future Splunk sidecar) doesn't care about case style or
+   abbreviations — it just wants stable identifiers. Renaming added zero
+   value to those tools and added cognitive load to humans.
+
+4. **Easier to extend.** If we want to add another stdlib field later
+   (e.g. `record.asctime` if our timestamp story changes), we don't have
+   to invent a name; stdlib already named it.
+
+5. **Loki labels are still ergonomic.** Query syntax like
+   `{level="ERROR"}` is unaffected — Alloy's `stage.labels` lets us name
+   the *Loki label* whatever we like (we keep it as `level`), independent
+   of the JSON field it pulled from (`levelname`). See the Alloy config
+   in the README.
+
+The cost was minor — a small change in the formatter and the tests, and
+this design note flipping its narrative — and the result is a smaller
+mental footprint for everyone who reads logs.
+
+## Loose alignment with OpenTelemetry
+
+We don't conform to OpenTelemetry's log data model — we deliberately
+prefer stdlib names where they exist — but the concepts overlap:
 
 | Our key | OTel equivalent |
 |---|---|
-| `ts` | `Timestamp` |
-| `level` | `SeverityText` |
-| `logger` | `InstrumentationScope.Name` (loosely) |
-| `msg` | `Body` |
+| `created` | `Timestamp` |
+| `levelname` | `SeverityText` |
+| `name` | `InstrumentationScope.Name` (loosely) |
+| `message` | `Body` |
 | `service` | `Resource.service.name` |
 | `hostname` | `Resource.host.name` |
-| `pid` | `Resource.process.pid` |
+| `process` | `Resource.process.pid` |
 | `task_id` | (would be a custom Attribute) |
-| `exc.name` / `exc.stack_trace` | `Attributes["exception.type"]` / `Attributes["exception.stacktrace"]` |
+| `exc_info.name` / `exc_info.stack_trace` | `Attributes["exception.type"]` / `Attributes["exception.stacktrace"]` |
 
-### Where we deliberately diverge from OTel
-
-If we were being maximally OTel-compatible, we'd flatten `exc.*` to
-dot-keyed attributes (`exception.type`, `exception.stacktrace`) and use
-`service.name` etc. with dots. We kept it flat-ish and human-friendly
-because:
-
-1. Nobody's actually consuming this as OTel — Alloy reads it as JSON,
-   LogQL queries it as JSON.
-2. Dotted keys in JSON make `| json` extraction in LogQL more awkward
-   (you have to write `service\.name`).
-3. The schema's audience is humans writing LogQL, not OTel collectors.
-
-That's why you see `service` (not `service.name`), `pid` (not
-`process.pid`), and `exc` as a nested object (not flattened).
+We chose stdlib over OTel because nobody is consuming this as OTel —
+Alloy reads it as JSON, LogQL queries it as JSON, and the audience for
+the schema is humans writing LogQL, not OTel collectors. If/when that
+changes, an OTel sidecar/exporter is one config block away.
 
 ## Stability promise
 
 Three things govern whether the schema can change:
 
 1. **Top-level key names are stable.** The Alloy config in the README
-   references `level`, `ts`, `task_id` by exact name. Renaming any of
-   them is a breaking change for every Alloy/LogQL config in the wild.
-2. **Casing is consistent.** Everything is `snake_case` (`task_id`,
-   `thread_name`). New keys must follow.
+   references `levelname`, `created`, `task_id` by exact name. Renaming
+   any of them is a breaking change for every Alloy/LogQL config in the
+   wild.
+2. **Names match stdlib `LogRecord` exactly** for any field that has a
+   stdlib equivalent. New keys we add can't shadow stdlib names with a
+   different meaning.
 3. **Adding keys is safe; removing or renaming is a major bump.**
    Append-only. Old log lines are queried for as long as your retention
    is, and consumers shouldn't break when they encounter pre-rename
@@ -154,27 +190,16 @@ The matching code-level guard is in `formatters.py`:
 # don't rename or remove existing ones without a major bump.
 ```
 
-## Variations we considered (and rejected)
-
-| Change | Pro | Con |
-|---|---|---|
-| `ts` → `timestamp` | More explicit | 4 extra bytes on every line, multiplied by billions of log lines |
-| `msg` → `message` | More explicit | Same as above; `msg` is also what stdlib calls it internally |
-| `task_id` → `trace_id` | Aligns with OTel/distributed tracing terminology | Conflates two concepts — a "task" in your system might span multiple OTel traces, or a single trace might cover work that's not a "task" |
-| Flatten `exc` to `exc_name`, `exc_details`, `exc_stack`, `exc_locals` | Easier to query in LogQL (no nested-key syntax) | Bigger lines, less obviously grouped, harder to add new exc fields later |
-| Add `level_no` as int | Cheap range queries (`level_no >= 40`) in LogQL | Redundant with `level`; LogQL `=~ "ERROR\|CRITICAL"` works fine |
-
 ## TL;DR
 
-- The keys were chosen, not standardised. There's no JSON-log spec the
-  formatter conforms to.
-- Mappings: see Groups 1–4 above. Drops: see Group 6.
-- Loose alignment with OpenTelemetry log data model, but flattened where
-  OTel's dotted keys would make LogQL awkward.
+- Keys mirror stdlib `LogRecord` attribute names exactly, no renames.
+- Reference: https://docs.python.org/3/library/logging.html#logrecord-attributes
+- We add four fields that don't exist on a `LogRecord`: `service`,
+  `env`, `hostname`, `task_id`. Plus your `task_context` extras.
+- We drop redundant stdlib fields (`msecs`, `levelno`, `relativeCreated`,
+  `processName`, `filename`, raw `msg`/`args`, `exc_text`, `stack_info`,
+  `taskName`).
 - Top-level keys are public API. Rename = major version bump. Add = free.
-
-If you want to propose a schema change, open an issue with:
-- the new/renamed key
-- which Group above it falls into
-- a concrete LogQL or Alloy use case that the current schema makes
-  awkward
+- Loki *label* names (set by Alloy) are independent of JSON *field*
+  names — we promote `levelname` to a label called `level` for query
+  ergonomics.

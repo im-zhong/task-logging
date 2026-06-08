@@ -85,7 +85,7 @@ Want human-readable output during local development? Pipe through `jq`:
 python -m myapp | jq
 ```
 
-That keeps every structured field (`task_id`, `exc.locals_dict`, …) visible — a "pretty" formatter would have to drop them.
+That keeps every structured field (`task_id`, `exc_info.locals_dict`, …) visible — a "pretty" formatter would have to drop them.
 
 ### 2. Use stdlib logging the normal way
 
@@ -136,34 +136,37 @@ Once Alloy → Loki → Grafana is running (see **Deployment** below), this LogQ
 
 ## What gets logged
 
-Every record is a single line of JSON with this stable shape:
+Every record is a single line of JSON with this stable shape. The keys mirror stdlib `LogRecord` attribute names — anyone who knows [stdlib logging](https://docs.python.org/3/library/logging.html#logrecord-attributes) already knows the schema:
 
 ```json
 {
-  "ts":          "2026-06-07T09:14:22.503112+00:00",
-  "level":       "INFO",
-  "logger":      "billing.settlement",
-  "msg":         "charging account",
-  "service":     "Billing",
-  "env":         "prod",
-  "hostname":    "worker-7",
-  "pid":         4321,
-  "thread":      140234567890,
-  "thread_name": "MainThread",
-  "task_id":     "task-42",
-  "module":      "settlement",
-  "func":        "charge",
-  "file":        "/app/billing/settlement.py",
-  "line":        87,
-  "exc":         null,
-  "user_id":     "u-1"
+  "created":    1717839622.503112,
+  "levelname":  "INFO",
+  "name":       "billing.settlement",
+  "message":    "charging account",
+  "process":    4321,
+  "thread":     140234567890,
+  "threadName": "MainThread",
+  "module":     "settlement",
+  "funcName":   "charge",
+  "pathname":   "/app/billing/settlement.py",
+  "lineno":     87,
+  "exc_info":   null,
+
+  "service":    "Billing",
+  "env":        "prod",
+  "hostname":   "worker-7",
+  "task_id":    "task-42",
+  "user_id":    "u-1"
 }
 ```
 
-`exc` is `null` for normal records and an object for exceptions:
+The first block mirrors stdlib LogRecord; the second block is fields we add (`service`, `env`, `hostname`, `task_id`, plus your `task_context` extras).
+
+`exc_info` is `null` for normal records and an object for exceptions:
 
 ```json
-"exc": {
+"exc_info": {
   "name":        "ZeroDivisionError",
   "details":     "division by zero",
   "stack_trace": "Traceback (most recent call last):\n  File ...",
@@ -353,22 +356,24 @@ loki.source.docker "containers" {
   forward_to = [loki.process.parse.receiver]
 }
 
-// Parse the JSON line, promote `level` to a Loki label, push `task_id`
-// into structured metadata (high-cardinality but still filterable).
+// Parse the JSON line. Field names match Python stdlib LogRecord
+// attributes (levelname, created, ...). We rename `levelname` to a
+// shorter `level` Loki label for query ergonomics — that's a labelling
+// decision, not a schema change in the JSON.
 loki.process "parse" {
   forward_to = [loki.write.default.receiver]
 
   stage.json {
     expressions = {
-      level   = "level",
-      ts      = "ts",
-      task_id = "task_id",
+      level   = "levelname",  // pull stdlib's `levelname` out as `level`
+      created = "created",    // Unix float timestamp from stdlib
+      task_id = "task_id",    // our own field
     }
   }
 
   stage.timestamp {
-    source = "ts"
-    format = "RFC3339Nano"
+    source = "created"
+    format = "Unix"
   }
 
   stage.labels {
@@ -408,11 +413,15 @@ Add Loki as a Grafana data source (`http://loki:3100`), then explore:
 # follow one request across services
 {env="prod"} | json | task_id="abc-123"
 
-# only errors, last hour
+# only errors, last hour (the Loki label `level` is set by Alloy from the
+# JSON `levelname` field — see the Alloy config above)
 {env="prod", level=~"ERROR|CRITICAL"}
 
-# filter on a structured field
+# filter on a structured field bound via task_context(user_id=...)
 {service="Billing"} | json | user_id="u-42"
+
+# filter on a stdlib LogRecord field after `| json`
+{service="Billing"} | json | funcName="charge"
 
 # isolate one container replica
 {service="OrderService", container="order-service-2"}
@@ -510,7 +519,7 @@ If you want a deeper mental model than this README provides, see [docs/](docs/):
 - [`docs/design/task-context.md`](docs/design/task-context.md) — how `task_context` makes `task_id` flow through threads, asyncio tasks, and third-party libraries' logs
 - [`docs/design/stdlib-logging-primer.md`](docs/design/stdlib-logging-primer.md) — bottom-up tour of stdlib `logging` (LogRecord, the logger tree, handlers, filters, formatters) with the rules that prevent the most common pitfalls
 - [`docs/design/why-json-logs.md`](docs/design/why-json-logs.md) — Loki accepts arbitrary text; why does this library emit JSON anyway? What do we gain, and what do we trade away?
-- [`docs/design/json-schema.md`](docs/design/json-schema.md) — where the JSON keys (`ts`, `level`, `service`, `task_id`, …) come from, what was renamed, what was dropped, and the stability promise
+- [`docs/design/json-schema.md`](docs/design/json-schema.md) — where the JSON keys come from, why we mirror stdlib LogRecord attribute names instead of inventing our own, and the stability promise
 
 ---
 

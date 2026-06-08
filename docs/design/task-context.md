@@ -219,9 +219,10 @@ with task_context(task_id="task-42", user_id="u-1"):
    `record.user_id = "u-1"`.
 
 5. `JsonFormatter.format(record)` reads all those attributes off the
-   record and produces:
+   record and produces (key names mirror stdlib `LogRecord` attributes;
+   see [json-schema.md](json-schema.md)):
    ```json
-   {"ts":"...","level":"INFO","msg":"hello","service":"OrderService","task_id":"task-42","user_id":"u-1",...}
+   {"created":1717839622.5,"levelname":"INFO","message":"hello","name":"biz","service":"OrderService","task_id":"task-42","user_id":"u-1",...}
    ```
 
 6. The handler writes that line to **stdout**. The container runtime
