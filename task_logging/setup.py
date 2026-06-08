@@ -108,16 +108,12 @@ def setup_task_logging(
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Idempotency: drop handlers we previously installed (identified by our
-    # private tag) and leave foreign ones alone. Without this, calling
-    # setup_task_logging() twice (in tests, hot-reloads, multi-step
-    # bootstrap) would stack handlers and produce duplicated log lines. We
-    # don't blanket-remove all handlers because a host application may have
-    # legitimately installed its own (e.g. Sentry's breadcrumb handler).
-    for h in list(root.handlers):
-        if getattr(h, "_task_logging_tag", None) == _HANDLER_TAG:
-            root.removeHandler(h)
-            h.close()
+    # Idempotency: drop handlers we previously installed (so calling this
+    # twice in tests / hot-reloads / multi-step bootstrap doesn't stack
+    # handlers and produce duplicated log lines). The same logic is exposed
+    # publicly as `shutdown_task_logging` for users who want to tear down
+    # explicitly.
+    shutdown_task_logging()
 
     target_stream = stream if stream is not None else sys.stdout
 
@@ -142,6 +138,47 @@ def setup_task_logging(
             logging.getLogger(name).setLevel(lvl)
 
     return root
+
+
+def shutdown_task_logging() -> None:
+    """Remove the handler installed by `setup_task_logging`.
+
+    Pair this with `setup_task_logging` when you need to undo it — tests
+    that share a Python process, hot-reloads, libraries that embed
+    `task_logging` and need to clean up on shutdown. Identifies our
+    handler by a private tag, so any handlers the host application
+    installed itself (Sentry, a debug `StreamHandler`, …) are left alone.
+
+    Idempotent. Safe to call repeatedly, and safe to call when
+    `setup_task_logging` was never called: in both cases it's a no-op.
+
+    What this does NOT do, by design:
+
+      - Does not restore `quiet_loggers` level changes. Recovering the
+        per-logger pre-setup level would require us to remember each
+        prior level (none of which we actually need to do our job),
+        and the result would still be best-effort.
+      - Does not restore the root logger's prior level.
+      - Does not reset the active `task_log_context` ContextVar — that's
+        per-task scope, not bound to setup/shutdown lifetime.
+
+    The intent is "dispose of resources we own (the handler) and let
+    other state lapse on its own." If you need a precise pre-setup
+    restore, snapshot the levels yourself before calling
+    `setup_task_logging`.
+    """
+    root = logging.getLogger()
+    # We don't blanket-remove all handlers — only ours. A host application
+    # may have legitimately installed its own (Sentry breadcrumb handler,
+    # OTel log handler, etc.) and would not appreciate us closing them.
+    for h in list(root.handlers):
+        if getattr(h, "_task_logging_tag", None) == _HANDLER_TAG:
+            root.removeHandler(h)
+            # close() flushes any buffered output and releases the
+            # underlying stream handle. Important for FileHandler
+            # subclasses; for StreamHandler(sys.stdout) it's effectively
+            # a flush.
+            h.close()
 
 
 def _tag(handler: logging.Handler) -> None:

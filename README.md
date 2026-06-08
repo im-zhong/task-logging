@@ -438,19 +438,21 @@ In a Kubernetes cluster, replace `discovery.docker` with `discovery.kubernetes` 
 
 ```python
 from task_logging import (
-    setup_task_logging,   # call once at startup
-    task_log_context,     # `with task_log_context({...}): ...`,
-                          # or imperative ctx.enter() / ctx.exit()
-    get_task_log_attrs,   # read the currently-active attrs (merged)
-    log_func_call,        # decorator: ENTER / EXIT / RAISE for a function
-    TaskLogFilter,        # the underlying logging.Filter
-    JsonFormatter,        # the underlying logging.Formatter
+    setup_task_logging,      # call once at startup
+    shutdown_task_logging,   # remove the handler setup_task_logging installed
+    task_log_context,        # `with task_log_context({...}): ...`,
+                             # or imperative ctx.enter() / ctx.exit()
+    get_task_log_attrs,      # read the currently-active attrs (merged)
+    log_func_call,           # decorator: ENTER / EXIT / RAISE for a function
+    TaskLogFilter,           # the underlying logging.Filter
+    JsonFormatter,           # the underlying logging.Formatter
 )
 ```
 
 | Symbol | Purpose |
 |---|---|
 | `setup_task_logging(global_log_attrs=..., level=..., ...)` | One-shot configuration of the root logger. Writes one JSON line per record to stdout. |
+| `shutdown_task_logging()` | Pair of `setup_task_logging`. Removes the handler we installed; idempotent. Mainly for tests, hot-reloads, and embedded use; long-running services typically don't call this. |
 | `task_log_context(attrs)` | Bind a dict of attrs to the current execution context. Supports both `with task_log_context({...}):` and imperative `ctx.enter()` / `ctx.exit()`. |
 | `get_task_log_attrs()` | Return the currently-active merged attrs (empty dict if no context is active). |
 | `log_func_call(logger=None, *, level=logging.INFO)` | Decorator that logs ENTER / EXIT / RAISE for a function. `logger=None` auto-resolves to the function's module logger. |
@@ -502,7 +504,7 @@ When this runs in a container, every line of stdout is JSON tagged with the requ
 - **`service` must be low-cardinality.** It becomes a Loki label. Use `"OrderService"`, never `"OrderService-pod-abc-7"`.
 - **`task_id` is per-request, never a label.** It rides inside the JSON payload. Loki ≥ 2.9 + `stage.structured_metadata` lets you filter on it efficiently.
 - **Exception capture only works inside `except` blocks.** The formatter reads `sys.exc_info()`, so call `log.exception(...)` while the exception is still being handled.
-- **Calling `setup_task_logging()` more than once is safe** — it removes its previous handlers before installing new ones, so tests / hot-reloads don't double-log.
+- **Calling `setup_task_logging()` more than once is safe** — it removes its previous handlers before installing new ones, so tests / hot-reloads don't double-log. Use `shutdown_task_logging()` to undo it explicitly (idempotent; leaves any handlers the host application installed alone).
 - **Disable locals capture in regulated environments.** Pass `capture_locals=False` to `setup_task_logging()` if `repr()` of arbitrary local variables could leak secrets.
 - **What about loguru?** loguru is not based on stdlib `logging`, so libraries like `requests` and `urllib3` won't be captured by it. This package deliberately uses stdlib so third-party logs flow through the same pipeline. If you want loguru in your own code, use loguru's `InterceptHandler` to bridge stdlib → loguru — but this library does not require it.
 

@@ -12,6 +12,7 @@ from task_logging import (
     get_task_log_attrs,
     log_func_call,
     setup_task_logging,
+    shutdown_task_logging,
     task_log_context,
 )
 
@@ -416,3 +417,68 @@ def test_repeated_setup_does_not_duplicate_handlers(buf: io.StringIO) -> None:
 
     logging.getLogger("biz").info("once")
     assert len(_read_json_lines(buf)) == 1
+
+
+def _our_handler_count() -> int:
+    return sum(
+        1
+        for h in logging.getLogger().handlers
+        if getattr(h, "_task_logging_tag", None) == "task_logging.handler"
+    )
+
+
+def test_shutdown_removes_our_handler(buf: io.StringIO) -> None:
+    setup_task_logging(stream=buf)
+    assert _our_handler_count() == 1
+
+    shutdown_task_logging()
+    assert _our_handler_count() == 0
+
+    # After shutdown, logs no longer flow into our buffer.
+    logging.getLogger("biz").info("orphan")
+    assert _read_json_lines(buf) == []
+
+
+def test_shutdown_is_idempotent(buf: io.StringIO) -> None:
+    setup_task_logging(stream=buf)
+    shutdown_task_logging()
+    # Calling it again on an already-clean root must not raise or affect
+    # foreign handlers.
+    shutdown_task_logging()
+    assert _our_handler_count() == 0
+
+
+def test_shutdown_without_prior_setup_is_a_noop() -> None:
+    # No setup_task_logging has been called in this test (the autouse
+    # fixture clears handlers before each test).
+    shutdown_task_logging()
+    assert _our_handler_count() == 0
+
+
+def test_shutdown_leaves_foreign_handlers_alone(buf: io.StringIO) -> None:
+    """A host app's own root handler must survive our teardown."""
+    setup_task_logging(stream=buf)
+
+    foreign = logging.StreamHandler(stream=io.StringIO())
+    logging.getLogger().addHandler(foreign)
+    try:
+        shutdown_task_logging()
+        # Foreign handler still attached, our tagged handler gone.
+        assert _our_handler_count() == 0
+        assert foreign in logging.getLogger().handlers
+    finally:
+        logging.getLogger().removeHandler(foreign)
+        foreign.close()
+
+
+def test_setup_after_shutdown_works_cleanly(buf: io.StringIO) -> None:
+    setup_task_logging(global_log_attrs={"service": "first"}, stream=buf)
+    shutdown_task_logging()
+
+    buf2 = io.StringIO()
+    setup_task_logging(global_log_attrs={"service": "second"}, stream=buf2)
+    logging.getLogger("biz").info("post-restart")
+
+    [record] = _read_json_lines(buf2)
+    assert record["service"] == "second"
+    assert record["message"] == "post-restart"
