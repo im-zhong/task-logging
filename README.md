@@ -63,26 +63,40 @@ Requires **Python 3.12+**. The library has **zero runtime dependencies** beyond 
 
 ## Quick Start
 
-### 1. Configure logging once at startup
+### 1. Wire up logging once at startup
+
+The library deliberately does not provide a one-call setup function — the wiring is six lines of stdlib, and hiding it behind a wrapper would force decisions that belong to you (which handler? which stream? which logger? idempotent or not?). Compose the primitives yourself:
 
 ```python
 import logging
-from task_logging import setup_task_logging
+import sys
+from task_logging import JsonFormatter, TaskLogFilter
 
-setup_task_logging(
-    global_log_attrs={
-        "service": "OrderService",                # used as a Loki label
-        "env": "prod",
-    },
-    level=logging.INFO,
-)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+handler.addFilter(TaskLogFilter(global_log_attrs={
+    "service": "OrderService",                    # used as a Loki label
+    "env": "prod",
+}))
 
-# Tame noisy third-party libraries with stdlib (this isn't something
-# task_logging wraps — it's a one-line stdlib call):
+root = logging.getLogger()
+root.addHandler(handler)
+root.setLevel(logging.INFO)
+
+# Tame noisy third-party libraries — also stdlib:
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 ```
 
+> ⚠️ **Attach `TaskLogFilter` to a HANDLER, not to a logger.** Logger-level filters don't see records propagated up from child loggers, so `requests` / `urllib3` / `boto3` records would slip past unenriched. Handler-level filters see every record that reaches the handler, which is what you want.
+
 After this, **every** stdlib logger in the process — yours and third-party — writes one line of **JSON** to **stdout**, ready for Alloy.
+
+If you need teardown (tests, hot-reloads), it's two lines of stdlib too:
+
+```python
+root.removeHandler(handler)
+handler.close()
+```
 
 Want human-readable output during local development? Pipe through `jq`:
 
@@ -164,7 +178,7 @@ Every record is a single line of JSON with this stable shape. The keys mirror st
 }
 ```
 
-The first block mirrors stdlib LogRecord; the second block is whatever **you** bound. The library does not auto-detect anything — `service`, `env`, `task_id`, `user_id` (and `hostname`, if you want it) are all supplied by you via `setup_task_logging(global_log_attrs=...)` and `task_log_context({...})`.
+The first block mirrors stdlib LogRecord; the second block is whatever **you** bound. The library does not auto-detect anything — `service`, `env`, `task_id`, `user_id` (and `hostname`, if you want it) are all supplied by you via `TaskLogFilter(global_log_attrs=...)` and `task_log_context({...})`.
 
 `exc_info` is `null` for normal records and an object for exceptions:
 
@@ -177,7 +191,7 @@ The first block mirrors stdlib LogRecord; the second block is whatever **you** b
 }
 ```
 
-`locals_dict` is a `repr()`-snapshot of the local variables at the deepest stack frame where the exception was raised — invaluable for post-mortem debugging. Disable it with `setup_task_logging(..., capture_locals=False)` if you're worried about secrets leaking into logs.
+`locals_dict` is a `repr()`-snapshot of the local variables at the deepest stack frame where the exception was raised — invaluable for post-mortem debugging. Disable it with `JsonFormatter(capture_locals=False)` if you're worried about secrets leaking into logs.
 
 ---
 
@@ -438,27 +452,26 @@ In a Kubernetes cluster, replace `discovery.docker` with `discovery.kubernetes` 
 
 ## Public API
 
+Five symbols, no setup wrapper. The library provides only the things you can't get from stdlib alone; the `Logger` / `Handler` wiring is yours.
+
 ```python
 from task_logging import (
-    setup_task_logging,      # call once at startup
-    shutdown_task_logging,   # remove the handler setup_task_logging installed
-    task_log_context,        # `with task_log_context({...}): ...`,
-                             # or imperative ctx.enter() / ctx.exit()
-    get_task_log_attrs,      # read the currently-active attrs (merged)
-    log_func_call,           # decorator: ENTER / EXIT / RAISE for a function
-    TaskLogFilter,           # the underlying logging.Filter
-    JsonFormatter,           # the underlying logging.Formatter
+    TaskLogFilter,        # logging.Filter — attach to a HANDLER (not a logger)
+    JsonFormatter,        # logging.Formatter — emits one JSON line per record
+    task_log_context,     # `with task_log_context({...}): ...`,
+                          # or imperative ctx.enter() / ctx.exit()
+    get_task_log_attrs,   # read the currently-active attrs (merged)
+    log_func_call,        # decorator: ENTER / EXIT / RAISE for a function
 )
 ```
 
 | Symbol | Purpose |
 |---|---|
-| `setup_task_logging(global_log_attrs=..., level=..., ...)` | One-shot configuration of the root logger. Writes one JSON line per record to stdout. |
-| `shutdown_task_logging()` | Pair of `setup_task_logging`. Removes the handler we installed; idempotent. Mainly for tests, hot-reloads, and embedded use; long-running services typically don't call this. |
-| `task_log_context(attrs)` | Bind a dict of attrs to the current execution context. Supports both `with task_log_context({...}):` and imperative `ctx.enter()` / `ctx.exit()`. |
+| `TaskLogFilter(global_log_attrs=None)` | A `logging.Filter` that copies each record and merges `global_log_attrs` + the active `task_log_context` attrs onto it. **Attach to a handler, not a logger.** |
+| `JsonFormatter(capture_locals=True)` | A `logging.Formatter` that emits one JSON line per record, with keys mirroring stdlib `LogRecord` attribute names. `capture_locals=False` disables the locals snapshot in exception logs. |
+| `task_log_context(attrs)` | Bind a dict of attrs to the current execution context. Use `with task_log_context({...}):`, or imperative `ctx.enter()` / `ctx.exit()` for middleware that splits enter/exit across hooks. |
 | `get_task_log_attrs()` | Return the currently-active merged attrs (empty dict if no context is active). |
-| `log_func_call(logger=None, *, level=logging.INFO)` | Decorator that logs ENTER / EXIT / RAISE for a function. `logger=None` auto-resolves to the function's module logger. |
-| `TaskLogFilter`, `JsonFormatter` | Exposed for advanced setups (e.g. attaching to a custom handler). |
+| `log_func_call(logger=None, *, level=logging.INFO)` | Decorator that logs `ENTER` / `EXIT` / `RAISE` for a function. `logger=None` auto-resolves to `logging.getLogger(func.__module__)`. |
 
 ---
 
@@ -466,9 +479,21 @@ from task_logging import (
 
 ```python
 import logging
-from task_logging import log_func_call, setup_task_logging, task_log_context
+import sys
+from task_logging import (
+    JsonFormatter,
+    TaskLogFilter,
+    log_func_call,
+    task_log_context,
+)
 
-setup_task_logging(global_log_attrs={"service": "Billing", "env": "prod"})
+# Wire up stdlib once at startup.
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(JsonFormatter())
+handler.addFilter(TaskLogFilter(global_log_attrs={"service": "Billing", "env": "prod"}))
+root = logging.getLogger()
+root.addHandler(handler)
+root.setLevel(logging.INFO)
 
 # Silence noisy third-party libraries via stdlib:
 for chatty in ("urllib3", "botocore"):
@@ -507,8 +532,22 @@ When this runs in a container, every line of stdout is JSON tagged with the requ
 - **`service` must be low-cardinality.** It becomes a Loki label. Use `"OrderService"`, never `"OrderService-pod-abc-7"`.
 - **`task_id` is per-request, never a label.** It rides inside the JSON payload. Loki ≥ 2.9 + `stage.structured_metadata` lets you filter on it efficiently.
 - **Exception capture only works inside `except` blocks.** The formatter reads `sys.exc_info()`, so call `log.exception(...)` while the exception is still being handled.
-- **Calling `setup_task_logging()` more than once is safe** — it removes its previous handlers before installing new ones, so tests / hot-reloads don't double-log. Use `shutdown_task_logging()` to undo it explicitly (idempotent; leaves any handlers the host application installed alone).
-- **Disable locals capture in regulated environments.** Pass `capture_locals=False` to `setup_task_logging()` if `repr()` of arbitrary local variables could leak secrets.
+- **Tests / hot-reloads need explicit teardown.** `addHandler` is additive — running your wiring twice stacks two handlers and logs each line twice. Stash the handler and remove it on teardown:
+
+  ```python
+  def setup_for_tests():
+      handler = logging.StreamHandler(sys.stdout)
+      handler.setFormatter(JsonFormatter())
+      handler.addFilter(TaskLogFilter(...))
+      logging.getLogger().addHandler(handler)
+      return handler
+
+  def teardown_for_tests(handler):
+      logging.getLogger().removeHandler(handler)
+      handler.close()
+  ```
+
+- **Disable locals capture in regulated environments.** Pass `capture_locals=False` to `JsonFormatter()` if `repr()` of arbitrary local variables could leak secrets.
 - **What about loguru?** loguru is not based on stdlib `logging`, so libraries like `requests` and `urllib3` won't be captured by it. This package deliberately uses stdlib so third-party logs flow through the same pipeline. If you want loguru in your own code, use loguru's `InterceptHandler` to bridge stdlib → loguru — but this library does not require it.
 
 ---
