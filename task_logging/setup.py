@@ -2,8 +2,7 @@
 
 Call `setup_logging()` once at process startup. Everything that uses stdlib
 `logging` afterwards — your code, `requests`, `urllib3`, `boto3`, … — will be
-captured and written to stdout (as JSON for Alloy, or as human-readable text
-when running interactively).
+captured and written to stdout as JSON, ready for Alloy / Loki ingestion.
 
 Why install handlers on the ROOT logger (not on a per-module logger):
     stdlib propagation walks records UP the logger tree until it hits a
@@ -24,11 +23,14 @@ Why write to STDOUT (not a file):
     stdout directly. No app-level file mounts. Multiple replicas of the same
     service show up as separate Loki streams automatically via container labels.
 
-Why JSON when not at a TTY, human-readable when at one:
-    A developer running `python -m myapp` at a terminal wants readable output;
-    a container in production wants JSON for Alloy's `stage.json`. We detect
-    which one we're in via `stdout.isatty()` by default, and let the user
-    force it either way with `json_format=True` / `False`.
+Why ALWAYS JSON (no human-readable mode):
+    Two output formats means two code paths to test, two schemas to document,
+    and recurring "is the field there or not?" questions when reading logs.
+    With one format, what you see in Grafana is exactly what you see when you
+    inspect locally. For human reading at a terminal, `docker logs <ctr> | jq`
+    or any JSON pretty-printer is one pipe away — and shows the structured
+    fields (task_id, exc.locals_dict, ...) that a "pretty" formatter would
+    have hidden.
 
 See docs/design/why-json-logs.md for the format choice and the README's
 "Deployment" section for the Alloy config. See docs/design/stdlib-logging-primer.md
@@ -54,13 +56,12 @@ def setup_logging(
     service: str,
     env: str | None = None,
     level: int | str = logging.INFO,
-    json_format: bool | None = None,
     stream: IO[str] | None = None,
     capture_locals: bool = True,
     static_fields: dict[str, Any] | None = None,
     quiet_loggers: dict[str, int] | None = None,
 ) -> logging.Logger:
-    """Configure the root logger to write to stdout for Alloy / Loki ingestion.
+    """Configure the root logger to write JSON to stdout for Alloy / Loki.
 
     Args:
         service:
@@ -71,17 +72,9 @@ def setup_logging(
             Optional environment label, e.g. "prod" / "dev".
         level:
             Root log level. Stdlib levels (`logging.INFO`) or names ("INFO").
-        json_format:
-            How to render each record:
-                - True  → always JSON (use this in containers / production).
-                - False → always human-readable text (use at a terminal).
-                - None (default) → auto-detect: JSON when stdout is not a
-                  TTY (containers, pipes), text when it is (interactive
-                  terminals).
         stream:
             The stream to write to. Defaults to `sys.stdout`. Override for
-            tests or unusual deployments where you want the records routed
-            elsewhere (e.g. a `StringIO` in tests).
+            tests or unusual deployments (e.g. a `StringIO` in tests).
         capture_locals:
             If True, exception logs include a repr-snapshot of the local
             variables at the deepest frame. Disable in low-trust environments
@@ -96,19 +89,15 @@ def setup_logging(
         The configured root logger.
 
     Example:
-        Production (in a Docker container) — stdout is not a TTY, so we
-        emit JSON automatically::
+        >>> setup_logging(
+        ...     service="OrderService",
+        ...     env="prod",
+        ...     quiet_loggers={"urllib3": logging.WARNING},
+        ... )
 
-            setup_logging(
-                service="OrderService",
-                env="prod",
-                quiet_loggers={"urllib3": logging.WARNING},
-            )
+        For human-readable output at a terminal, pipe through `jq`:
 
-        Development at a terminal — auto-detected human-readable text. Or
-        force one format explicitly::
-
-            setup_logging(service="OrderService", json_format=False)
+            $ python -m myapp | jq
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -126,19 +115,8 @@ def setup_logging(
 
     target_stream = stream if stream is not None else sys.stdout
 
-    # Auto-detect JSON vs human format from TTY status if not explicitly set.
-    # `isatty()` may not exist on every stream-like object (e.g. StringIO in
-    # tests has it; arbitrary file-likes might not), so guard with getattr.
-    if json_format is None:
-        isatty = getattr(target_stream, "isatty", None)
-        json_format = not (callable(isatty) and isatty())
-
     ctx_filter = TaskContextFilter(service=service, env=env, extra=static_fields)
-    formatter: logging.Formatter = (
-        JsonFormatter(capture_locals=capture_locals)
-        if json_format
-        else _HumanFormatter()
-    )
+    formatter = JsonFormatter(capture_locals=capture_locals)
 
     handler = logging.StreamHandler(stream=target_stream)
     handler.setFormatter(formatter)
@@ -162,20 +140,3 @@ def setup_logging(
 
 def _tag(handler: logging.Handler) -> None:
     handler._task_logging_tag = _HANDLER_TAG  # type: ignore[attr-defined]  # noqa: SLF001
-
-
-class _HumanFormatter(logging.Formatter):
-    """A compact, human-friendly format that surfaces the task_id."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        task_id = getattr(record, "task_id", None)
-        prefix = f"[{task_id}] " if task_id else ""
-        base = (
-            f"{self.formatTime(record, '%Y-%m-%d %H:%M:%S')} "
-            f"{record.levelname:<8} "
-            f"{record.name} "
-            f"{prefix}{record.getMessage()}"
-        )
-        if record.exc_info:
-            base += "\n" + self.formatException(record.exc_info)
-        return base

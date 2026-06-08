@@ -314,16 +314,12 @@ Two methods worth knowing:
 Now you can read the whole flow without surprise:
 
 ```python
-def setup_logging(*, service, env=None, level=INFO, json_format=None, ...):
+def setup_logging(*, service, env=None, level=INFO, ...):
     root = logging.getLogger()                # the tree's root
     root.setLevel(level)                      # global threshold
 
     ctx_filter = TaskContextFilter(service, env)
-    formatter = (
-        JsonFormatter() if (json_format if json_format is not None
-                            else not sys.stdout.isatty())
-        else _HumanFormatter()
-    )
+    formatter  = JsonFormatter()
 
     handler = StreamHandler(sys.stdout)       # one handler, stdout
     handler.setFormatter(formatter)           # how to render

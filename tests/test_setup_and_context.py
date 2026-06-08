@@ -177,18 +177,8 @@ def test_quiet_loggers_are_silenced(buf: io.StringIO) -> None:
     assert record["msg"] == "should pass"
 
 
-def test_json_format_can_be_forced_off(buf: io.StringIO) -> None:
-    """`json_format=False` makes even non-TTY streams emit human text."""
-    setup_logging(service="svc", stream=buf, json_format=False)
-    logging.getLogger("biz").info("hello")
-    output = buf.getvalue()
-    assert "hello" in output
-    # Human format is NOT valid JSON (it has spaces, brackets, etc., not "{").
-    assert not output.strip().startswith("{")
-
-
-def test_json_format_auto_picks_text_for_a_tty() -> None:
-    """When stdout looks like a TTY, default to human text."""
+def test_output_is_always_json_even_for_a_tty_like_stream() -> None:
+    """No matter what the stream looks like, output is JSON."""
 
     class FakeTTY(io.StringIO):
         def isatty(self) -> bool:  # type: ignore[override]
@@ -198,8 +188,9 @@ def test_json_format_auto_picks_text_for_a_tty() -> None:
     setup_logging(service="svc", stream=fake)
     logging.getLogger("biz").info("hello")
     output = fake.getvalue()
-    assert "hello" in output
-    assert not output.strip().startswith("{")  # not JSON
+    assert output.strip().startswith("{")  # JSON, regardless of TTY status
+    record = json.loads(output)
+    assert record["msg"] == "hello"
 
 
 def test_log_call_emits_enter_and_exit(buf: io.StringIO) -> None:

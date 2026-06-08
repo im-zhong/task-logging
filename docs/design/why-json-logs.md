@@ -141,11 +141,11 @@ In a multi-service environment that's the right hill to die on.
 
 To be honest about the tradeoffs:
 
-1. **Humans can't read raw JSON logs as easily.** That's why
-   `setup_logging` auto-detects: when stdout is a TTY (you're at a
-   terminal), it emits human-readable text; when stdout is a pipe
-   (containers, `docker logs`, anywhere Alloy is reading), it emits
-   JSON. Force one or the other with `json_format=True` / `False`.
+1. **Humans can't read raw JSON logs as easily.** Pipe through `jq`
+   for local development: `python -m myapp | jq`, or
+   `docker logs <ctr> | jq`. We considered shipping a "pretty" text
+   formatter that auto-engages at a TTY, and decided against it — see
+   "Why one format, not two" below.
 
 2. **Slightly larger on-disk footprint.** All those `"key":` repetitions
    add up. In practice Loki/Alloy compress chunks heavily and this
@@ -160,6 +160,38 @@ To be honest about the tradeoffs:
    roughly a few microseconds per log call. Negligible unless you're
    logging in a tight inner loop, in which case you should batch or
    sample.
+
+## Why one format, not two
+
+Earlier versions of `setup_logging` shipped a second "human-readable"
+formatter that engaged automatically when stdout was a TTY. We removed
+it. The reasons:
+
+1. **Two code paths, two test surfaces.** Every fix to the JSON formatter
+   had to be checked against the human one, and vice versa. Bugs leaked
+   between them.
+
+2. **Different output in dev vs prod is a footgun.** A subtle field
+   missing from the human formatter wouldn't be noticed locally but
+   would matter the moment you read the same log line in Grafana. One
+   format means what you see at `python -m myapp | jq` is what Alloy
+   sees in production.
+
+3. **`jq` is already a better human formatter.** It pretty-prints, it
+   colourises, and crucially it shows *every* structured field — `task_id`,
+   `exc.locals_dict`, `user_id`, … — that a hand-rolled "pretty" formatter
+   would have hidden to keep lines short. So at a terminal,
+   `python -m myapp | jq` (or `docker logs <ctr> | jq`) is the recommended
+   path.
+
+4. **TTY auto-detection is fragile.** `stdout.isatty()` returns False
+   inside `pytest` capture, inside CI, inside `tmux pipe-pane`, and
+   sometimes inside Docker exec depending on flags. The "right" format
+   was hard to predict.
+
+If you want a different output in production vs development, the answer
+is a wrapper script (`python -m myapp | jq` for one, raw stdout for the
+other), not a library knob.
 
 ## When *not* to use JSON
 
@@ -192,6 +224,7 @@ that JSON also happens to be Loki/Alloy's smoothest input format is icing.
 - The one-line JSON contract is also the most durable choice for a
   multi-service environment where the same log stream might be consumed
   by tools you haven't picked yet.
-- This library still emits human-readable text at an interactive
-  *terminal* — JSON is for non-TTY stdout, where machines read it (Alloy,
-  `docker logs | jq`, …), not the terminal where you do.
+- The library emits JSON unconditionally. For human reading at a
+  terminal, pipe through `jq`: `python -m myapp | jq` or
+  `docker logs <ctr> | jq`. One format means dev and prod logs look
+  the same.

@@ -77,13 +77,15 @@ setup_logging(
 )
 ```
 
-After this, **every** stdlib logger in the process — yours and third-party — writes to **stdout**.
+After this, **every** stdlib logger in the process — yours and third-party — writes one line of **JSON** to **stdout**, ready for Alloy.
 
-Format auto-detection:
-- In a container or when stdout is piped → **JSON**, ready for Alloy.
-- At an interactive terminal → **human-readable text**, easy to scan.
+Want human-readable output during local development? Pipe through `jq`:
 
-Force one or the other with `setup_logging(..., json_format=True | False)`.
+```bash
+python -m myapp | jq
+```
+
+That keeps every structured field (`task_id`, `exc.locals_dict`, …) visible — a "pretty" formatter would have to drop them.
 
 ### 2. Use stdlib logging the normal way
 
@@ -440,7 +442,7 @@ from task_logging import (
 
 | Symbol | Purpose |
 |---|---|
-| `setup_logging(service=..., env=..., level=..., json_format=None, ...)` | One-shot configuration of the root logger. Writes to stdout. `json_format=None` auto-detects (JSON when not at a TTY, human text when at one). |
+| `setup_logging(service=..., env=..., level=..., ...)` | One-shot configuration of the root logger. Writes one JSON line per record to stdout. |
 | `task_context(task_id=..., **extra)` | Context manager that binds fields onto every log inside the block. |
 | `bind_task_context(**extra)` / `unbind_task_context(token)` | Imperative pair for non-`with` use. |
 | `get_task_id()` / `get_task_context()` | Read the currently active context. |
