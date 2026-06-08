@@ -121,6 +121,143 @@ emitted automatically without code changes.
 The curation optimises for "useful in Loki, queryable in LogQL, doesn't
 waste bytes" — everything redundant or noisy got dropped.
 
+## Why `message` and `exc_info` are special
+
+If the formatter is "emit `record.__dict__` minus a drop-list," why does
+`format()` have explicit lines for `message` and `exc_info`? They look
+like noise — until you notice they're there for **two completely
+different reasons**, and removing either special would break something.
+
+### `message`: the value isn't on the record yet
+
+`record.__dict__` contains `record.msg` (the format string `"hello %s"`)
+and `record.args` (the tuple `("alice",)`), but **not** `record.message`
+(the formatted result `"hello alice"`).
+
+Why? Because stdlib delays the `%` substitution until something asks
+for it. `LogRecord.getMessage()` is what does the work:
+
+```python
+def getMessage(self):
+    msg = str(self.msg)
+    if self.args:
+        msg = msg % self.args
+    return msg
+```
+
+This is the lazy-formatting optimisation discussed in the
+[stdlib primer](stdlib-logging-primer.md): if a record is filtered out
+before any handler emits it, we never paid the formatting cost. Stdlib's
+own `Formatter.format()` calls `record.message = self.formatMessage(record)`
+at the very start to make the formatted text available — and we have to
+do the same thing because we're a custom Formatter.
+
+So the line
+
+```python
+payload["message"] = record.getMessage()
+```
+
+is what *creates* the `message` key. It's not a special case in the
+"this attribute needs custom handling" sense; it's a bridge between
+stdlib's lazy-formatting protocol and our format-and-emit pipeline. We
+then drop `msg` and `args` from the output (via
+`_DROPPED_LOGRECORD_ATTRS`) because they're already encoded inside
+`message` and keeping them would just bloat each line with the
+un-substituted form.
+
+### `exc_info`: the value isn't JSON-serialisable
+
+`record.exc_info` on a `LogRecord` is the raw 3-tuple from `sys.exc_info()`:
+
+```python
+(<class 'ZeroDivisionError'>, ZeroDivisionError('division by zero'), <traceback object at 0x7f...>)
+```
+
+Three values, **none of them JSON-serialisable**:
+
+| Element | Type | Why JSON can't handle it |
+|---|---|---|
+| `exc_type` | `type` (the exception class) | Class objects aren't a JSON type |
+| `exc_value` | `BaseException` instance | Arbitrary Python object |
+| `exc_tb` | `TracebackType` | Linked list of frames; frames hold code objects, locals dicts of arbitrary objects, etc. |
+
+If we let it fall through the comprehension, `json.dumps` would hit
+our `_json_default` fallback, which calls `repr()`, producing:
+
+```
+"(<class 'ZeroDivisionError'>, ZeroDivisionError('division by zero'), <traceback object at 0x7f...>)"
+```
+
+Technically valid JSON, but **all the actual debugging value is gone**
+— no formatted stack trace, no locals at the throw site, no programmatic
+access to the exception type. We'd have failed at our one job.
+
+So `exc_info` gets rendered into a JSON-friendly structure:
+
+```json
+{
+  "name": "ZeroDivisionError",
+  "details": "division by zero",
+  "stack_trace": "Traceback (most recent call last):\n  File ...",
+  "locals_dict": {"a": "1", "b": "0"}
+}
+```
+
+We keep the *key name* `exc_info` (matching stdlib), and only replace
+the *value shape*. That's why the drop-list contains `"exc_info"` — to
+suppress the raw tuple — and we then assign our rendered version under
+the same key.
+
+### Alternatives we rejected
+
+Could we eliminate the specials entirely? Yes, in two ways, both worse:
+
+**Option A — render at filter time, not formatter time.** Have
+`TaskContextFilter` write `record.message` and a rendered
+`record.exc_info` *onto the record*, so by the time the formatter runs,
+`record.__dict__` already has the JSON-friendly values. The
+comprehension would then be a true one-liner with no specials.
+
+We don't do this because:
+
+- Filters become coupled to the *output format*'s serialisation
+  constraints. Today the filter only stamps fields that are already
+  JSON-friendly (strings/ints/None) and is format-agnostic.
+- We'd lose the lazy-formatting optimisation. `record.message` would be
+  computed on every record that passes through the filter, even ones a
+  downstream handler-filter or level threshold would have dropped.
+- It muddles the separation of concerns: filters enrich, formatters
+  serialise.
+
+**Option B — pattern-match the tuple shape in `_json_default`.** Have
+the `default=` callback recognise `(type, exc, tb)` shapes and render
+them, so the comprehension can pass `exc_info` through unchanged.
+
+We don't do this because:
+
+- Pattern-matching a tuple shape in a generic callback is fragile —
+  what if user code binds an unrelated 3-tuple via `task_context`?
+- The transformation is *structural* (one tuple → one nested object
+  with four keys), not just *encoding* (which is what `default=` is for).
+- It buries an important design decision in a fallback path most
+  readers won't read.
+
+The current shape — drop the raw value via the negative filter, write
+the rendered shape under the same key — is explicit about what's
+happening, and the cost is two extra blocks of code.
+
+### TL;DR
+
+| Field | Why special | Could it not be special? |
+|---|---|---|
+| `message` | The value isn't on `record.__dict__`; it's lazily computed via `getMessage()` | Only by giving up lazy formatting (worse) |
+| `exc_info` | The value (a `(type, exc, tb)` tuple) isn't JSON-serialisable | Only by rendering it earlier in a filter (worse separation of concerns) or via fragile shape-matching in `default=` (worse explicitness) |
+
+Every other field on the record is already JSON-friendly *and* already
+on `record.__dict__`, so it sails through the comprehension without
+help.
+
 ## Why mirror stdlib names?
 
 We previously renamed several keys (`level`, `logger`, `msg`, `func`,

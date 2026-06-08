@@ -79,7 +79,7 @@ _DROPPED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
         "processName",
         "relativeCreated",
         "stack_info",
-        "taskName",  # Python 3.12+
+        # "taskName",  # Python 3.12+
     }
 )
 
@@ -155,23 +155,35 @@ class JsonFormatter(logging.Formatter):
             if key not in _DROPPED_LOGRECORD_ATTRS and not key.startswith("_")
         }
 
-        # `message` is computed lazily on the LogRecord (via getMessage()) —
-        # it's not in record.__dict__ until something calls Formatter.format,
-        # so the comprehension above misses it. Stdlib's own Formatter calls
-        # record.getMessage() here too.
+        # ----- two specials, for two DIFFERENT reasons -----
+        # See docs/design/json-schema.md "Why message and exc_info are special"
+        # for the longer treatment, including alternatives we rejected.
+
+        # `message` is special because the VALUE ISN'T ON record.__dict__ YET.
+        # stdlib delays %-substitution until something asks for it, so the
+        # record carries `msg` (format string) and `args` (tuple) but no
+        # `message`. record.getMessage() does the substitution. We compute
+        # it here for the same reason stdlib's own Formatter does — and the
+        # raw `msg` / `args` are in _DROPPED_LOGRECORD_ATTRS to avoid
+        # bloating each line with the un-substituted form.
         payload["message"] = record.getMessage()
 
-        # `exc_info` on the record is a raw (type, value, tb) tuple, which
-        # isn't JSON-serialisable and isn't useful as-is. Replace it with our
-        # rendered {name, details, stack_trace, locals_dict} object — under
-        # the SAME key, so the JSON name still matches the LogRecord name.
-        # We dropped the raw tuple via _DROPPED_LOGRECORD_ATTRS above.
+        # `exc_info` is special because the VALUE ISN'T JSON-SERIALISABLE.
+        # On a LogRecord it's the raw sys.exc_info() tuple — (type, value,
+        # tb) — none of whose elements are JSON-encodable. Letting it fall
+        # through json.dumps(default=...) would produce a useless
+        # "(<class 'X'>, X(...), <traceback at 0x...>)" string with no
+        # stack trace and no locals. We render it into a structured object
+        # ({name, details, stack_trace, locals_dict}) under the SAME key
+        # so the JSON name still matches the LogRecord name; the raw tuple
+        # is dropped via _DROPPED_LOGRECORD_ATTRS to make room.
         payload["exc_info"] = (
             self._render_exc_info(record.exc_info) if record.exc_info else None
         )
 
         return json.dumps(payload, default=_json_default, ensure_ascii=False)
 
+    # 这个函数的实现和第一版是差不多的
     def _render_exc_info(
         self,
         exc_info: tuple[type[BaseException], BaseException, TracebackType | None]
