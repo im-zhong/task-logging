@@ -11,6 +11,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    strategy:
+      # Run the full matrix even if one version fails — we want to see
+      # which versions break, not just the first one.
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -19,16 +26,16 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Install Python
-        run: uv python install 3.12
+        run: uv python install ${{ matrix.python-version }}
 
       - name: Sync dependencies
-        run: uv sync --group dev
+        run: uv sync --group dev --python ${{ matrix.python-version }}
 
       - name: Ruff
-        run: uv run ruff check .
+        run: uv run --python ${{ matrix.python-version }} ruff check .
 
       - name: MyPy
-        run: uv run mypy .
+        run: uv run --python ${{ matrix.python-version }} mypy .
 
       - name: Pytest
-        run: uv run pytest --cov=task_logging --cov-report=term-missing\
+        run: uv run --python ${{ matrix.python-version }} pytest --cov=task_logging --cov-report=term-missing

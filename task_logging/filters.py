@@ -24,8 +24,13 @@ Why we COPY the record instead of mutating it:
     copy per record per handler, which is negligible.
 
     stdlib supports this directly: a Filter's `filter()` may return a
-    LogRecord (instead of a bool) and stdlib's Filterer.filter will use that
-    record downstream in this handler's chain only.
+    LogRecord (instead of a bool) and stdlib's Filterer.filter will use
+    that record downstream in this handler's chain only. Note: this
+    "return a LogRecord to substitute" semantic landed in Python 3.12
+    (see the "Changed in version 3.12" note on `logging.Filter.filter`).
+    The library's `requires-python = ">=3.12"` is partly because of this —
+    on 3.10/3.11 the returned record would be treated as a truthy bool and
+    our enrichment would silently vanish.
 
 Why we DON'T protect stdlib field names from being overwritten:
     Earlier revisions had a `_RESERVED_LOGRECORD_ATTRS` set that silently
@@ -106,7 +111,13 @@ class TaskLogFilter(logging.Filter):
             dict(global_log_attrs) if global_log_attrs else {}
         )
 
-    def filter(self, record: logging.LogRecord) -> logging.LogRecord:
+    def filter(self, record: logging.LogRecord) -> logging.LogRecord:  # type: ignore[override]
+        # The override-ignore is a typeshed gap, not a runtime concern.
+        # Stdlib widened `Filter.filter`'s return type to `bool | LogRecord`
+        # in Python 3.12, but typeshed's stubs still declare it as `bool`.
+        # The runtime behaviour is exactly what we want; only the type
+        # checker disagrees.
+        #
         # Shallow-copy is enough: LogRecord's interesting state is its
         # __dict__, which copy.copy duplicates. The expensive bits — exc_info
         # tuples, stack frames — are immutable from our perspective and
@@ -119,8 +130,8 @@ class TaskLogFilter(logging.Filter):
         for key, value in {**self._global_log_attrs, **get_task_log_attrs()}.items():
             setattr(record, key, value)
 
-        # Returning a LogRecord (not a bool) is stdlib-blessed: stdlib's
-        # Filterer.filter accepts either, and a returned record replaces the
-        # original for THIS handler's chain only. Other handlers on the same
-        # record see the unmodified original.
+        # Returning a LogRecord (not a bool) is stdlib-blessed since 3.12:
+        # stdlib's Filterer.filter accepts either, and a returned record
+        # replaces the original for THIS handler's chain only. Other handlers
+        # on the same record see the unmodified original.
         return record

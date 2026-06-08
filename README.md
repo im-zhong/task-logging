@@ -57,7 +57,7 @@ Or with [uv](https://docs.astral.sh/uv/):
 uv add task-logging
 ```
 
-Requires **Python 3.12+**. The library has **zero runtime dependencies** beyond the stdlib.
+Requires **Python 3.12+** (tested on 3.12 – 3.14). The library has **zero runtime dependencies** beyond the stdlib.
 
 ---
 

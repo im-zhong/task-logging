@@ -4,12 +4,16 @@ version = "0.0.1"
 description = ""
 authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
-requires-python = ">=3.12,<4.0"
+requires-python = ">=3.10,<4.0"
 dependencies = []
 
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
@@ -36,6 +40,10 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 fix = true
+# Pin lint target to the lowest supported runtime so version-aware rules
+# (UP, FA, PYI, …) judge the code against 3.10's syntax/library surface
+# rather than the developer's local interpreter.
+target-version = "py310"
 
 
 [tool.ruff.lint]
@@ -66,14 +74,15 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests are allowed to use raw literals, raise inline, and skip return annotations.
 "tests/*" = ["ANN201", "ANN202", "EM101", "EM102", "PLR2004", "TRY301", "INP001"]
-# `setup_logging` is a configuration entry point; many keyword-only args are intentional.
-"task_logging/setup.py" = ["PLR0913"]
 # `_render_exc_info` mirrors stdlib's `logging.Formatter` signature, which uses bool|tuple.
 "task_logging/formatters.py" = ["FBT001"]
 
 
 [tool.mypy]
 strict = true
+# Type-check against the lowest supported version so we can't accidentally
+# rely on stdlib stubs or typing constructs only present on newer runtimes.
+python_version = "3.10"
 
 
 # https://docs.astral.sh/uv/guides/package/
