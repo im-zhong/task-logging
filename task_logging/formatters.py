@@ -186,6 +186,37 @@ class JsonFormatter(logging.Formatter):
         # ({name, details, stack_trace, locals_dict}) under the SAME key
         # so the JSON name still matches the LogRecord name; the raw tuple
         # is dropped via _DROPPED_LOGRECORD_ATTRS to make room.
+        #
+        # When is `record.exc_info` actually set? This is a frequent point
+        # of confusion ("why does logger.exception() in an except block
+        # produce exc_info but logger.info() in the same block doesn't?"),
+        # so the rule is worth pinning down here:
+        #
+        #   stdlib's Logger._log() reads sys.exc_info() ONLY when the
+        #   call's `exc_info` parameter is truthy. It does NOT inspect
+        #   the live exception state on its own.
+        #
+        # The methods differ only in their default for that parameter:
+        #
+        #   logger.info(msg)          → exc_info=False (default) → no capture
+        #   logger.info(msg, exc_info=True)
+        #                             → captures sys.exc_info() if inside except
+        #   logger.exception(msg)     → exc_info=True (built into the method) →
+        #                               captures, that's its whole job
+        #   logger.error(msg, exc_info=True)
+        #                             → equivalent to logger.exception(msg)
+        #
+        # So `logger.info()` inside an `except` block does NOT get exc_info
+        # — Python knows about the live exception (via sys.exc_info()) but
+        # stdlib's logger machinery doesn't peek at it without permission.
+        # If you call `logger.info(...)` here, `record.exc_info` is None
+        # and our payload["exc_info"] correctly ends up None.
+        #
+        # The asymmetry is by design: most info/debug calls happen in
+        # except blocks for unrelated reasons (e.g. logging recovery
+        # progress) and should NOT spam every record with the live
+        # traceback. The user opts in via `exc_info=True` or by switching
+        # to `logger.exception()`.
         payload["exc_info"] = (
             self._render_exc_info(record.exc_info) if record.exc_info else None
         )
