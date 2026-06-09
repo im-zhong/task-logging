@@ -103,7 +103,7 @@ class task_log_context:  # noqa: N801 (callable-named-as-class is intentional â€
 
     __slots__ = ("_attrs", "_token")
 
-    def __init__(self, attrs: dict[str, Any] | None = None, /) -> None:
+    def __init__(self, attrs: dict[str, Any] | None = None) -> None:
         # We store a defensive copy so subsequent caller mutations to `attrs`
         # don't bleed into the bound context after the fact.
         self._attrs: dict[str, Any] = dict(attrs) if attrs else {}

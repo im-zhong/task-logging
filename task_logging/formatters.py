@@ -44,6 +44,7 @@ import json
 import logging
 import sys
 import traceback
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any
 
@@ -51,9 +52,9 @@ from typing import Any
 # Everything else on record.__dict__ — including stdlib's own fields and any
 # extras stamped on by filters / `extra=` / task_context — is emitted as-is.
 #
-# Reasons each is dropped (see docs/design/json-schema.md "Group 5"):
+# Reasons each is dropped (see docs/design/json-schema.md "Group 4"):
 #   args / msg            -- already substituted into `message`
-#   msecs / relativeCreated / asctime
+#   msecs / relativeCreated
 #                         -- redundant with the float `created`
 #   levelno               -- redundant with `levelname`
 #   exc_info              -- handled specially: the raw tuple is replaced
@@ -64,10 +65,17 @@ from typing import Any
 #   filename              -- redundant with `pathname` (basename only)
 #   taskName              -- asyncio task name, conflicts semantically with
 #                            our `task_id`
+#
+# Note: `asctime` is INTENTIONALLY not dropped. It's redundant-by-value
+# with `created` (both encode the same instant), but they're for
+# different audiences — `created` for log shippers (Alloy parses it as a
+# Unix float for free), `asctime` for humans tailing stdout or piping
+# `docker logs ... | jq`. Shipping both costs ~32 bytes per record and
+# eliminates the "I can't read this without a parser" pain. See
+# docs/design/json-schema.md "Why we ship both `created` and `asctime`".
 _DROPPED_LOGRECORD_ATTRS: frozenset[str] = frozenset(
     {
         "args",
-        "asctime",
         "exc_info",  # rewritten under the same key with our structured shape
         "exc_text",
         "filename",
@@ -89,9 +97,10 @@ class JsonFormatter(logging.Formatter):
     built-in fields, anything stamped on by filters (service, env, hostname,
     task_id), and any user fields bound via `task_context(**extra)` — minus
     a small drop-list of redundant / internal attributes
-    (`_DROPPED_LOGRECORD_ATTRS`). Two values are computed specially:
+    (`_DROPPED_LOGRECORD_ATTRS`). Three values are computed specially:
 
       - `message`  – `record.getMessage()` (lazy %-formatting)
+      - `asctime`  – ISO-8601 timestamp string (lazy, like message)
       - `exc_info` – `record.exc_info` rendered into a structured object
                      (name / details / stack_trace / locals_dict)
 
@@ -103,6 +112,7 @@ class JsonFormatter(logging.Formatter):
 
         {
           "created":    1717839622.503112,
+          "asctime":    "2024-06-08T14:20:22.503112Z",
           "levelname":  "INFO",
           "name":       "billing.settlement",
           "message":    "charging account",
@@ -165,6 +175,27 @@ class JsonFormatter(logging.Formatter):
         # raw `msg` / `args` are in _DROPPED_LOGRECORD_ATTRS to avoid
         # bloating each line with the un-substituted form.
         payload["message"] = record.getMessage()
+
+        # `asctime` is special for the SAME reason as `message`: stdlib only
+        # populates record.asctime when a formatter calls record.usesTime() +
+        # formatTime() — it's not on record.__dict__ until then. We compute
+        # it ourselves as an ISO-8601 UTC string with the trailing 'Z' (the
+        # short form for +00:00; same instant either way, 5 fewer bytes).
+        #
+        # Why ship asctime AT ALL when `created` already carries the same
+        # instant? Different audiences:
+        #   - `created` (float) is for log shippers — Alloy parses it as
+        #     `format = "Unix"`, the most efficient parser path.
+        #   - `asctime` (string) is for humans tailing stdout, piping
+        #     `docker logs ctr` through a terminal, or `cat`ing the
+        #     captured file. A bare Unix float in those views is
+        #     unreadable.
+        # ~32 bytes per record buys "I can read this without a parser."
+        payload["asctime"] = (
+            datetime.fromtimestamp(record.created, tz=UTC)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
 
         # `exc_info` is special because the VALUE ISN'T JSON-SERIALISABLE.
         # On a LogRecord it's the raw sys.exc_info() tuple — (type, value,

@@ -1,6 +1,6 @@
 [project]
 name = "task-logging"
-version = "0.1.0"
+version = "0.1.1"
 description = "Task-aware structured logging for distributed Python services."
 authors = [{ name = "zhangzhong", email = "im.zhong@outlook.com" }]
 readme = "README.md"
