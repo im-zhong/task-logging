@@ -50,6 +50,7 @@ Every key in the JSON falls into one of the four groups below.
 | JSON key | stdlib `LogRecord` attribute |
 |---|---|
 | `created` | `record.created` (Unix timestamp as float) |
+| `asctime` | ISO-8601 UTC string with `Z` suffix, computed from `record.created` — see "Why we ship both `created` and `asctime`" below |
 | `levelname` | `record.levelname` (`"INFO"`, `"ERROR"`, …) |
 | `name` | `record.name` (the logger name) |
 | `message` | `record.getMessage()` (the formatted message) |
@@ -110,7 +111,7 @@ emitted automatically without code changes.
 | Dropped | Why |
 |---|---|
 | `record.args`, `record.msg` (raw) | Already substituted into `message` via `getMessage()`. Keeping the format string + args in JSON would be redundant and inflate line size. |
-| `record.msecs`, `record.relativeCreated`, `record.asctime` | All redundant with the float `created` (`stage.timestamp` parses it to whatever Loki wants). |
+| `record.msecs`, `record.relativeCreated` | Redundant with the float `created` (`stage.timestamp` parses it to whatever Loki wants). `asctime` is also redundant *by value* but we keep it anyway — see the next section. |
 | `record.levelno` | Redundant with `levelname`. Filtering by `levelname=ERROR` is sufficient; few queries need the integer. |
 | `record.exc_text`, `record.stack_info` | Already encoded inside `exc_info.stack_trace`. |
 | `record.processName` | Almost always `"MainProcess"`. Useless noise. |
@@ -119,6 +120,67 @@ emitted automatically without code changes.
 
 The curation optimises for "useful in Loki, queryable in LogQL, doesn't
 waste bytes" — everything redundant or noisy got dropped.
+
+## Why we ship both `created` and `asctime`
+
+`created` (Unix float) and `asctime` (ISO-8601 string) encode the same
+instant. By the rule above — "drop redundant fields" — `asctime` should
+be on the drop list. It isn't. The two are for **different audiences**:
+
+|              | `created` (Unix float)                   | `asctime` (ISO-8601 string)                    |
+|---           |---                                       |---                                              |
+| **Reader**   | Log shippers — Alloy, Vector, Promtail   | Humans — `cat`, `tail`, `docker logs`, `jq`     |
+| **Example**  | `1717839622.503112`                      | `"2024-06-08T14:20:22.503112Z"`                 |
+| **Parsing**  | None. Alloy's `format = "Unix"` is the most efficient parser path it has. | Human eyes do it free; tools use `format = "RFC3339Nano"` if needed. |
+| **Sortable** | Yes, numerically — bulletproof.          | Yes, lexicographically — but **only** while everyone uses the same fixed format. Comma-vs-period locale variants break this. |
+| **Cost**     | ~17 bytes                                | ~32 bytes                                       |
+| **stdlib name** | `LogRecord.created` ✓                 | `LogRecord.asctime` ✓                           |
+
+The dev-loop case is what tips the balance. When you're staring at
+stdout during local development, or grepping `docker logs ctr` in a
+production incident at 3am, a bare Unix float is unreadable. You shouldn't
+need to remember the `jq` recipe for `.created | todate` (which doesn't
+even preserve microseconds) just to know roughly when something happened.
+
+Loki / Alloy still use `created` as the canonical timestamp. The Alloy
+config in the README does:
+
+```alloy
+stage.timestamp {
+  source = "created"
+  format = "Unix"
+}
+```
+
+`asctime` is purely "for the human reading the raw line." We don't
+even ask Alloy to parse it; it just rides along in the JSON, ignored
+by the parser stage.
+
+### Why ISO 8601 with `Z`, not the stdlib default
+
+stdlib's default `record.asctime` format is `"2024-06-08 14:20:22,503"`
+(space-separated, comma between seconds and milliseconds). That format
+is hard for ingestion tools to parse reliably — Alloy / Vector / jq all
+prefer ISO 8601 / RFC 3339. So we set the format explicitly:
+
+```python
+datetime.fromtimestamp(record.created, tz=UTC).isoformat(
+    timespec="microseconds"
+).replace("+00:00", "Z")
+```
+
+Three deliberate choices in that one line:
+
+1. **`tz=UTC`** — the produced string is unambiguously UTC. No "looks like
+   timestamp X but actually means timezone-local X" confusion when reading
+   logs from a service whose host happens to be in a different timezone.
+2. **`timespec="microseconds"`** — matches `created`'s precision. The two
+   fields encode the same instant to the same resolution; you can
+   round-trip from one to the other losslessly.
+3. **`"Z"` suffix instead of `"+00:00"`** — equivalent (5 bytes shorter
+   per record), more conventional in RFC 3339 contexts, and `datetime.fromisoformat`
+   on Python 3.11+ parses both. Tools without `Z` support are dead — we
+   don't care about them.
 
 ## Why `message` and `exc_info` are special
 

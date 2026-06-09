@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from datetime import datetime
 from types import TracebackType
 
 from task_logging import JsonFormatter
@@ -74,7 +75,6 @@ def test_dropped_stdlib_fields_are_absent() -> None:
     for absent in (
         "msg",
         "args",
-        "asctime",
         "exc_text",
         "filename",
         "levelno",
@@ -95,11 +95,39 @@ def test_dropped_stdlib_fields_are_absent() -> None:
         "pathname",
         "lineno",
         "created",
+        "asctime",  # ISO-8601 string for human readers; see formatters.py
         "process",
         "thread",
         "exc_info",
     ):
         assert present in payload, f"{present} should be kept"
+
+
+def test_asctime_is_iso8601_utc_matching_created() -> None:
+    """`asctime` is the ISO-8601 UTC string for the same instant as `created`.
+
+    Pinned because:
+      - The 'Z' suffix matters — RFC 3339 / ISO 8601, no offset ambiguity.
+      - Microsecond precision must round-trip cleanly with `created` (a
+        Unix float with microsecond resolution).
+      - Other tools (Alloy's `format = "RFC3339Nano"`, jq's `fromdateiso8601`)
+        rely on this exact shape.
+    """
+    record = _make_record()
+    payload = json.loads(JsonFormatter().format(record))
+
+    asctime = payload["asctime"]
+    assert asctime.endswith("Z"), f"expected trailing Z, got {asctime!r}"
+    assert "T" in asctime, f"expected ISO date-T-time separator, got {asctime!r}"
+
+    # Round-trip: parsing `asctime` back should give the same instant as
+    # `created`, to microsecond precision. (Sub-microsecond drift can
+    # sneak in via float rounding, hence the 1e-6 tolerance.)
+    parsed = datetime.fromisoformat(asctime)
+    offset = parsed.utcoffset()
+    assert offset is not None
+    assert offset.total_seconds() == 0
+    assert abs(parsed.timestamp() - payload["created"]) < 1e-6
 
 
 def test_extra_attrs_on_record_are_emitted() -> None:

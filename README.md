@@ -159,6 +159,7 @@ Every record is a single line of JSON with this stable shape. The keys mirror st
 ```json
 {
   "created":    1717839622.503112,
+  "asctime":    "2024-06-08T14:20:22.503112Z",
   "levelname":  "INFO",
   "name":       "billing.settlement",
   "message":    "charging account",
@@ -179,6 +180,8 @@ Every record is a single line of JSON with this stable shape. The keys mirror st
 ```
 
 The first block mirrors stdlib LogRecord; the second block is whatever **you** bound. The library does not auto-detect anything — `service`, `env`, `task_id`, `user_id` (and `hostname`, if you want it) are all supplied by you via `TaskLogFilter(global_log_attrs=...)` and `task_log_context({...})`.
+
+`created` and `asctime` carry the same instant, intentionally. `created` (Unix float) is what Alloy parses into Loki's timestamp; `asctime` (ISO-8601 with `Z` suffix) is what humans read when staring at `docker logs ctr` without a parser. ~32 extra bytes per record buys "I can tell when this happened" without piping through `jq` or `date -d`.
 
 `exc_info` is `null` for normal records and an object for exceptions:
 
